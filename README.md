@@ -13,7 +13,7 @@ for the full specification.
 ## Phase tracker
 
 - [x] Phase 0 — workspace scaffold: all crates, shared types, config loading, logging, Makefile
-- [ ] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
+- [x] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
 - [ ] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
 - [ ] Phase 3 — node agent (reconcile assigned pods, report status)
 - [ ] Phase 4 — multi-node + scheduler
@@ -51,3 +51,21 @@ make e2e        # scripted end-to-end smoke test
 `RUST_LOG` controls verbosity (e.g. `RUST_LOG=debug make dev-up`). Component
 config files live in `config/<component>.yaml`; an explicit `--config <path>`
 or `RK_CONFIG=<path>` overrides the default search.
+
+## Container runner (Phase 1 scope)
+
+`rkrt` is the development CLI over `rk-runtime`. Pulling works anywhere;
+running containers needs root, cgroups v2 and overlayfs — i.e. the Ubuntu
+24.04 VM, never the dev workstation:
+
+```sh
+cargo build --release -p rk-runtime          # builds target/release/rkrt
+rkrt pull nginx                              # digest-verified pull from Docker Hub
+rkrt run --name web --memory 256Mi --cpus 500m nginx
+curl http://10.42.0.6/                       # nginx, from the VM host
+rkrt ps && rkrt logs web
+rkrt stop web && rkrt rm web
+```
+
+`scripts/phase1-demo.sh` runs that whole loop end to end (design notes in
+[docs/phase-1-notes.md](docs/phase-1-notes.md)).
