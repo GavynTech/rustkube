@@ -40,19 +40,30 @@ pub struct ContainerState {
     pub created_at: String,
 }
 
-/// OCI image config exec rules: ENTRYPOINT is fixed, CMD provides default
-/// arguments, and a command given at run time replaces CMD (never ENTRYPOINT)
-/// — exactly Docker's semantics.
+/// Kubernetes exec rules, which subsume Docker's: `command` overrides the
+/// image ENTRYPOINT, `args` overrides the image CMD, and overriding the
+/// entrypoint *without* args drops the image CMD entirely:
+///
+/// | command | args | argv                    |
+/// |---------|------|-------------------------|
+/// | unset   | unset| entrypoint ++ cmd       |
+/// | unset   | set  | entrypoint ++ args      |
+/// | set     | unset| command                 |
+/// | set     | set  | command ++ args         |
 pub fn assemble_argv(
     entrypoint: Option<&[String]>,
     cmd: Option<&[String]>,
-    run_command: &[String],
+    command: Option<&[String]>,
+    args: Option<&[String]>,
 ) -> Result<Vec<String>> {
-    let mut argv: Vec<String> = entrypoint.unwrap_or_default().to_vec();
-    if run_command.is_empty() {
-        argv.extend(cmd.unwrap_or_default().iter().cloned());
-    } else {
-        argv.extend(run_command.iter().cloned());
+    let mut argv: Vec<String> = match command {
+        Some(command) => command.to_vec(),
+        None => entrypoint.unwrap_or_default().to_vec(),
+    };
+    match (command, args) {
+        (_, Some(args)) => argv.extend(args.iter().cloned()),
+        (None, None) => argv.extend(cmd.unwrap_or_default().iter().cloned()),
+        (Some(_), None) => {}
     }
     if argv.is_empty() {
         return Err(RuntimeError::NoCommand);
@@ -108,25 +119,23 @@ mod tests {
     }
 
     #[test]
-    fn entrypoint_plus_cmd_concatenate() {
-        let argv = assemble_argv(
-            Some(&strings(&["/docker-entrypoint.sh"])),
-            Some(&strings(&["nginx", "-g", "daemon off;"])),
-            &[],
-        )
-        .unwrap();
+    fn the_four_kubernetes_exec_cases() {
+        let entrypoint = strings(&["/docker-entrypoint.sh"]);
+        let cmd = strings(&["nginx", "-g", "daemon off;"]);
+
+        // command unset, args unset: entrypoint ++ cmd.
+        let argv = assemble_argv(Some(&entrypoint), Some(&cmd), None, None).unwrap();
         assert_eq!(
             argv,
             strings(&["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"])
         );
-    }
 
-    #[test]
-    fn run_command_replaces_cmd_not_entrypoint() {
+        // command unset, args set: entrypoint ++ args (image cmd dropped).
         let argv = assemble_argv(
-            Some(&strings(&["/docker-entrypoint.sh"])),
-            Some(&strings(&["nginx"])),
-            &strings(&["nginx-debug", "-g", "daemon off;"]),
+            Some(&entrypoint),
+            Some(&cmd),
+            None,
+            Some(&strings(&["nginx-debug", "-g", "daemon off;"])),
         )
         .unwrap();
         assert_eq!(
@@ -134,16 +143,35 @@ mod tests {
             strings(&["/docker-entrypoint.sh", "nginx-debug", "-g", "daemon off;"])
         );
 
-        let bare = assemble_argv(None, None, &strings(&["/bin/sh"])).unwrap();
-        assert_eq!(bare, strings(&["/bin/sh"]));
+        // command set, args unset: command alone — image cmd must NOT leak in.
+        let argv = assemble_argv(
+            Some(&entrypoint),
+            Some(&cmd),
+            Some(&strings(&["/bin/sh", "-c", "true"])),
+            None,
+        )
+        .unwrap();
+        assert_eq!(argv, strings(&["/bin/sh", "-c", "true"]));
+
+        // command set, args set: command ++ args.
+        let argv = assemble_argv(
+            Some(&entrypoint),
+            Some(&cmd),
+            Some(&strings(&["/bin/echo"])),
+            Some(&strings(&["hello"])),
+        )
+        .unwrap();
+        assert_eq!(argv, strings(&["/bin/echo", "hello"]));
     }
 
     #[test]
     fn empty_exec_is_an_error() {
         assert!(matches!(
-            assemble_argv(None, None, &[]),
+            assemble_argv(None, None, None, None),
             Err(RuntimeError::NoCommand)
         ));
+        // An explicitly empty args list still falls back to nothing — error.
+        assert!(assemble_argv(None, None, None, Some(&[])).is_err());
     }
 
     #[test]

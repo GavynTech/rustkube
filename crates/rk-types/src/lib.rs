@@ -12,6 +12,8 @@
 
 pub mod apply;
 pub mod bootstrap;
+#[cfg(feature = "client")]
+pub mod client;
 pub mod cluster;
 pub mod data;
 pub mod ingress;

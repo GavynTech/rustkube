@@ -142,6 +142,9 @@ fn prepare(
             }
         }
     }
+    if kind == ResourceKind::Secret {
+        normalize_secret(&mut data)?;
+    }
 
     Ok(StoredObject {
         kind,
@@ -150,6 +153,42 @@ fn prepare(
         revision: 0, // assigned by the store
         data,
     })
+}
+
+/// Secret admission, like Kubernetes: plaintext `stringData` entries are
+/// folded into base64 `data` (overwriting duplicate keys) so secrets are
+/// stored in one canonical shape.
+fn normalize_secret(data: &mut Value) -> Result<(), ApiError> {
+    use base64::Engine as _;
+    let Some(object) = data.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(string_data) = object.remove("stringData") else {
+        return Ok(());
+    };
+    let Value::Object(string_data) = string_data else {
+        return Err(ApiError::BadRequest(
+            "stringData must be an object of string values".to_owned(),
+        ));
+    };
+    let folded = object
+        .entry("data")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(folded) = folded.as_object_mut() else {
+        return Err(ApiError::BadRequest("data must be an object".to_owned()));
+    };
+    for (key, value) in string_data {
+        let Value::String(plain) = value else {
+            return Err(ApiError::BadRequest(format!(
+                "stringData.{key} must be a string"
+            )));
+        };
+        folded.insert(
+            key,
+            Value::String(base64::engine::general_purpose::STANDARD.encode(plain.as_bytes())),
+        );
+    }
+    Ok(())
 }
 
 fn meta_mut(data: &mut Value) -> Result<&mut serde_json::Map<String, Value>, ApiError> {
@@ -478,5 +517,22 @@ mod tests {
     fn unknown_plurals_are_not_found() {
         assert!(parse_kind("gizmos").is_err());
         assert_eq!(parse_kind("pods").unwrap(), ResourceKind::Pod);
+    }
+
+    #[test]
+    fn secret_string_data_folds_into_data_on_admission() {
+        let manifest = serde_json::json!({
+            "kind": "Secret",
+            "metadata": { "name": "creds" },
+            "data": { "existing": "eA==" },
+            "stringData": { "password": "hunter2", "existing": "new" }
+        });
+        let object = prepare(ResourceKind::Secret, None, None, manifest).unwrap();
+        assert!(object.data.get("stringData").is_none());
+        assert_eq!(object.data["data"]["password"], "aHVudGVyMg==");
+        assert_eq!(
+            object.data["data"]["existing"], "bmV3",
+            "stringData wins on duplicates"
+        );
     }
 }

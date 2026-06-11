@@ -1295,6 +1295,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1408,6 +1417,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -1899,12 +1909,16 @@ name = "rk-agent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "futures-util",
+ "nix 0.30.1",
  "rk-net",
  "rk-runtime",
  "rk-types",
  "serde",
  "serde_yaml",
+ "tokio",
  "tracing",
 ]
 
@@ -1914,6 +1928,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "futures-core",
@@ -1950,7 +1965,6 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
- "reqwest",
  "rk-types",
  "serde",
  "serde_json",
@@ -2026,6 +2040,9 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "futures-core",
+ "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",

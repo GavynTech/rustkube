@@ -15,7 +15,7 @@ for the full specification.
 - [x] Phase 0 — workspace scaffold: all crates, shared types, config loading, logging, Makefile
 - [x] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
 - [x] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
-- [ ] Phase 3 — node agent (reconcile assigned pods, report status)
+- [x] Phase 3 — node agent (reconcile assigned pods, report status)
 - [ ] Phase 4 — multi-node + scheduler
 - [ ] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates)
 - [ ] Phase 6 — networking (bridge/veth, VXLAN, service VIPs, DNS)
@@ -59,6 +59,27 @@ makes the above read as written.) `RUST_LOG` controls verbosity (e.g.
 `RUST_LOG=debug make dev-up`). Component config files live in
 `config/<component>.yaml`; an explicit `--config <path>` or
 `RK_CONFIG=<path>` overrides the default search.
+
+## Node agent (Phase 3 scope)
+
+On the Ubuntu VM, as root: start `rk-api` and `rk-agent`, and pods bound to
+the node (via `spec.nodeName` — the scheduler arrives in Phase 4) actually
+run, report status, self-heal per their restart policy, and tear down on
+delete:
+
+```sh
+./target/release/rk-api  &       # control plane
+./target/release/rk-agent &      # registers the node, reconciles pods
+rk-ctl get nodes                 # NAME      STATUS   AGE
+rk-ctl apply -f mypod.yaml       # pod with spec.nodeName set
+rk-ctl get pods                  # web-0  Running  0  10.42.0.6  rustkube  12s
+curl http://10.42.0.6/
+rk-ctl delete pod web-0
+```
+
+`scripts/phase3-demo.sh` runs the full loop — registration, pull, run, curl,
+kill-and-self-heal, run-to-completion, teardown (design notes in
+[docs/phase-3-notes.md](docs/phase-3-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

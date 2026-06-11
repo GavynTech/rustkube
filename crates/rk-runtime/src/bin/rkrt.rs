@@ -80,11 +80,14 @@ enum Cmd {
         /// When to pull the image.
         #[arg(long, value_parser = parse_pull_policy, default_value = "auto")]
         pull: PullPolicy,
+        /// Replace the image ENTRYPOINT (Kubernetes `command` semantics).
+        #[arg(long)]
+        entrypoint: Option<String>,
         /// Image reference.
         image: String,
-        /// Command to run instead of the image CMD (ENTRYPOINT still applies).
+        /// Arguments replacing the image CMD (ENTRYPOINT still applies).
         #[arg(trailing_var_arg = true)]
-        command: Vec<String>,
+        args: Vec<String>,
     },
     /// List containers.
     Ps,
@@ -158,8 +161,9 @@ fn run_cli() -> anyhow::Result<()> {
             memory,
             env,
             pull,
+            entrypoint,
             image,
-            command,
+            args,
         } => {
             let summary = runtime.block_on(container::run(
                 &store,
@@ -168,7 +172,8 @@ fn run_cli() -> anyhow::Result<()> {
                     image,
                     limits: Limits { cpu: cpus, memory },
                     env,
-                    command,
+                    command: entrypoint.map(|e| vec![e]),
+                    args: (!args.is_empty()).then_some(args),
                     pull,
                 },
             ))?;

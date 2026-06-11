@@ -242,7 +242,9 @@ pub struct VolumeMount {
 #[serde(rename_all = "camelCase", default)]
 pub struct PodStatus {
     pub phase: PodPhase,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Kubernetes spells the acronym in full caps — `podIP`, not the
+    /// `podIp` that camelCase renaming would produce.
+    #[serde(rename = "podIP", skip_serializing_if = "Option::is_none")]
     pub pod_ip: Option<Ipv4Addr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,

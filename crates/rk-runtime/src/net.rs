@@ -142,32 +142,51 @@ async fn setup_host_side(
         .await
         .map_err(|err| RuntimeError::net("creating veth pair", err.to_string()))?;
 
-    let peer = link_index(&handle, peer_name).await?;
-    handle
-        .link()
-        .set(
-            rtnetlink::LinkUnspec::new_with_index(peer)
-                .setns_by_pid(shim_pid as u32)
-                .build(),
-        )
-        .execute()
-        .await
-        .map_err(|err| RuntimeError::net("moving peer into netns", err.to_string()))?;
+    // From here the pair exists; failures must take it down again or every
+    // failed start leaks a dangling host-namespace veth pair.
+    let result = async {
+        let peer = link_index(&handle, peer_name).await?;
+        handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(peer)
+                    .setns_by_pid(shim_pid as u32)
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|err| RuntimeError::net("moving peer into netns", err.to_string()))?;
 
-    let host = link_index(&handle, host_name).await?;
-    handle
-        .address()
-        .add(host, net.host_ip.into(), 30)
-        .execute()
-        .await
-        .map_err(|err| RuntimeError::net("addressing host veth", err.to_string()))?;
-    handle
-        .link()
-        .set(rtnetlink::LinkUnspec::new_with_index(host).up().build())
-        .execute()
-        .await
-        .map_err(|err| RuntimeError::net("raising host veth", err.to_string()))?;
-    Ok(())
+        let host = link_index(&handle, host_name).await?;
+        handle
+            .address()
+            .add(host, net.host_ip.into(), 30)
+            .execute()
+            .await
+            .map_err(|err| RuntimeError::net("addressing host veth", err.to_string()))?;
+        handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(host).up().build())
+            .execute()
+            .await
+            .map_err(|err| RuntimeError::net("raising host veth", err.to_string()))?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        delete_link_quietly(&handle, host_name).await;
+    }
+    result
+}
+
+/// Best-effort delete of one veth end (the kernel removes the pair). Used on
+/// error paths only — the primary teardown is the netns dying.
+async fn delete_link_quietly(handle: &rtnetlink::Handle, name: &str) {
+    if let Ok(index) = link_index(handle, name).await
+        && let Err(err) = handle.link().del(index).execute().await
+    {
+        tracing::warn!(link = name, error = %err, "failed to delete leftover veth");
+    }
 }
 
 /// Container-side half, run on a thread that has joined the shim's netns:

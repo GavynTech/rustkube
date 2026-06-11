@@ -34,7 +34,10 @@ pub struct RunOptions {
     pub image: String,
     pub limits: cgroup::Limits,
     pub env: Vec<String>,
-    pub command: Vec<String>,
+    /// Overrides the image ENTRYPOINT (Kubernetes `command`).
+    pub command: Option<Vec<String>>,
+    /// Overrides the image CMD (Kubernetes `args`).
+    pub args: Option<Vec<String>>,
     pub pull: PullPolicy,
 }
 
@@ -112,6 +115,13 @@ async fn ensure_image(store: &Store, image: &ImageRef, policy: PullPolicy) -> Re
     Ok(record)
 }
 
+/// Create and start a container.
+///
+/// **Contract for embedding binaries**: starting a container re-executes
+/// `/proc/self/exe` with `argv[1] == "shim"`. Every binary that calls this
+/// (rkrt, rk-agent, ...) must route that argv to [`crate::init::shim_main`]
+/// in `main()` *before* any async runtime or thread exists — the shim forks,
+/// and clap would otherwise eat the argument and exit.
 pub async fn run(store: &Store, opts: RunOptions) -> Result<RunSummary> {
     needs_root()?;
     spec::validate_name(&opts.name)?;
@@ -140,7 +150,12 @@ pub async fn run(store: &Store, opts: RunOptions) -> Result<RunSummary> {
         ),
         None => (None, None, None, String::new()),
     };
-    let argv = spec::assemble_argv(entrypoint, cmd, &opts.command)?;
+    let argv = spec::assemble_argv(
+        entrypoint,
+        cmd,
+        opts.command.as_deref(),
+        opts.args.as_deref(),
+    )?;
     let env = spec::assemble_env(image_env, &opts.env);
 
     let id = random_id()?;
@@ -182,6 +197,42 @@ async fn start_prepared(
     let container_dir = container_dir.to_path_buf();
     let rootfs_path = rootfs::mount_rootfs(store, &container_dir, &record.layers)?;
     let pod_net = net::allocate(store)?;
+
+    // The address block is only recorded in state.json near the end, so
+    // until then failures must hand it back themselves — otherwise every
+    // failed start leaks a /30 the generic teardown can't find.
+    let result = start_networked(
+        opts,
+        &container_dir,
+        id,
+        rootfs_path,
+        pod_net,
+        argv,
+        env,
+        working_dir,
+    )
+    .await;
+    if result.is_err() {
+        let _ = net::release(store, pod_net.block);
+    }
+    result
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal seam for error unwinding"
+)]
+async fn start_networked(
+    opts: &RunOptions,
+    container_dir: &Path,
+    id: &str,
+    rootfs_path: PathBuf,
+    pod_net: net::PodNet,
+    argv: Vec<String>,
+    env: Vec<String>,
+    working_dir: String,
+) -> Result<RunSummary> {
+    let container_dir = container_dir.to_path_buf();
     rootfs::write_etc_hosts(&rootfs_path, &opts.name, &pod_net.container_ip.to_string())?;
 
     let runtime_spec = RuntimeSpec {
@@ -271,11 +322,20 @@ async fn start_prepared(
     // The shim now forks PID 1; wait briefly for evidence either way. The
     // shim is intentionally not waited on — it outlives this process as the
     // container's supervisor.
+    //
+    // Order matters: the shim writes `pid1` before it can possibly write
+    // `exit-status`, so a present pid1 means the start *succeeded* — even if
+    // the workload already finished (`/bin/true` exits within the first
+    // poll; that's a fast success, not a failed start). Only an exit status
+    // with no pid1 — which the shim never produces — falls through to the
+    // failure branch, kept for robustness.
     let pid1_path = container_dir.join("pid1");
     let exit_path = container_dir.join("exit-status");
     let deadline = Instant::now() + Duration::from_secs(5);
     let pid1 = loop {
-        if let Ok(raw) = fs::read_to_string(&exit_path) {
+        if !pid1_path.exists()
+            && let Ok(raw) = fs::read_to_string(&exit_path)
+        {
             let tail = log_tail(&log_path, 5);
             return Err(RuntimeError::FailedToStart {
                 name: opts.name.clone(),

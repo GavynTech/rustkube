@@ -7,6 +7,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The HTTP/watch client for talking to rk-api (agent, scheduler, controllers,
+# CLI). Off by default so pure-types consumers don't build reqwest.
+client = ["dep:reqwest", "dep:futures-core", "dep:futures-util"]
+
 [dependencies]
 serde.workspace = true
 serde_yaml.workspace = true
@@ -16,6 +21,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true
 base64.workspace = true
+
+reqwest = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

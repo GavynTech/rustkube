@@ -69,11 +69,42 @@ pub fn headers(kind: ResourceKind, with_namespace: bool) -> Vec<&'static str> {
         Vec::new()
     };
     headers.push("NAME");
-    if kind == ResourceKind::Pod {
-        headers.extend(["STATUS", "NODE"]);
+    match kind {
+        ResourceKind::Pod => headers.extend(["STATUS", "RESTARTS", "IP", "NODE"]),
+        ResourceKind::Node => headers.push("STATUS"),
+        _ => {}
     }
     headers.push("AGE");
     headers
+}
+
+/// A pod's display status: the waiting reason when a container is stuck
+/// (CrashLoopBackOff, ErrImagePull) reads better than the bare phase.
+fn pod_display_status(object: &Value) -> String {
+    if let Some(reason) = object
+        .pointer("/status/containerStatuses/0/state/waiting/reason")
+        .and_then(Value::as_str)
+        .filter(|r| *r != "ContainerCreating")
+    {
+        return reason.to_owned();
+    }
+    field(object, "/status/phase")
+        .unwrap_or("Pending")
+        .to_owned()
+}
+
+fn pod_restarts(object: &Value) -> String {
+    object
+        .pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .map(|statuses| {
+            statuses
+                .iter()
+                .filter_map(|s| s.get("restartCount").and_then(Value::as_u64))
+                .sum::<u64>()
+        })
+        .unwrap_or(0)
+        .to_string()
 }
 
 pub fn row(
@@ -95,19 +126,31 @@ pub fn row(
             .unwrap_or("<unnamed>")
             .to_owned(),
     );
-    if kind == ResourceKind::Pod {
-        // No agent yet (Phase 3) — unscheduled, statusless pods read Pending,
-        // matching what Kubernetes shows before kubelet picks a pod up.
-        row.push(
-            field(object, "/status/phase")
-                .unwrap_or("Pending")
-                .to_owned(),
-        );
-        row.push(
-            field(object, "/spec/nodeName")
-                .unwrap_or("<none>")
-                .to_owned(),
-        );
+    match kind {
+        ResourceKind::Pod => {
+            // A statusless pod reads Pending, matching what Kubernetes shows
+            // before a kubelet picks the pod up.
+            row.push(pod_display_status(object));
+            row.push(pod_restarts(object));
+            row.push(
+                field(object, "/status/podIP")
+                    .unwrap_or("<none>")
+                    .to_owned(),
+            );
+            row.push(
+                field(object, "/spec/nodeName")
+                    .unwrap_or("<none>")
+                    .to_owned(),
+            );
+        }
+        ResourceKind::Node => {
+            row.push(
+                field(object, "/status/condition")
+                    .unwrap_or("Unknown")
+                    .to_owned(),
+            );
+        }
+        _ => {}
     }
     row.push(age_of(object, now));
     row
@@ -155,29 +198,73 @@ mod tests {
     }
 
     #[test]
-    fn pod_rows_show_status_and_node() {
+    fn pod_rows_show_status_restarts_ip_and_node() {
         let now = Utc::now();
         let pod = serde_json::json!({
             "metadata": { "name": "web-0", "namespace": "prod",
                           "creationTimestamp": (now - chrono::Duration::seconds(30)).to_rfc3339() },
             "spec": { "nodeName": "worker-1" },
-            "status": { "phase": "Running" }
+            "status": {
+                "phase": "Running",
+                "podIP": "10.42.0.6",
+                "containerStatuses": [{ "name": "nginx", "restartCount": 2,
+                                        "state": { "running": {} } }]
+            }
         });
         assert_eq!(
             row(ResourceKind::Pod, &pod, true, now),
-            vec!["prod", "web-0", "Running", "worker-1", "30s"]
+            vec![
+                "prod",
+                "web-0",
+                "Running",
+                "2",
+                "10.42.0.6",
+                "worker-1",
+                "30s"
+            ]
         );
 
         let bare = serde_json::json!({ "metadata": { "name": "new-pod" } });
         assert_eq!(
             row(ResourceKind::Pod, &bare, false, now),
-            vec!["new-pod", "Pending", "<none>", "<unknown>"]
+            vec!["new-pod", "Pending", "0", "<none>", "<none>", "<unknown>"]
+        );
+    }
+
+    #[test]
+    fn crash_loops_show_their_waiting_reason() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "web-0" },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{ "state": { "waiting": { "reason": "CrashLoopBackOff" } },
+                                        "restartCount": 4 }]
+            }
+        });
+        let row = row(ResourceKind::Pod, &pod, false, Utc::now());
+        assert_eq!(row[1], "CrashLoopBackOff");
+        assert_eq!(row[2], "4");
+    }
+
+    #[test]
+    fn node_rows_show_the_condition() {
+        let node = serde_json::json!({
+            "metadata": { "name": "worker-1" },
+            "status": { "condition": "Ready" }
+        });
+        assert_eq!(
+            row(ResourceKind::Node, &node, false, Utc::now()),
+            vec!["worker-1", "Ready", "<unknown>"]
         );
     }
 
     #[test]
     fn headers_match_row_shapes() {
-        assert_eq!(headers(ResourceKind::Pod, true).len(), 5);
+        assert_eq!(headers(ResourceKind::Pod, true).len(), 7);
+        assert_eq!(
+            headers(ResourceKind::Node, false),
+            vec!["NAME", "STATUS", "AGE"]
+        );
         assert_eq!(headers(ResourceKind::ConfigMap, false), vec!["NAME", "AGE"]);
     }
 }

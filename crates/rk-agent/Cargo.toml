@@ -8,12 +8,16 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-rk-types.workspace = true
+rk-types = { workspace = true, features = ["client"] }
 rk-runtime.workspace = true
 rk-net.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
+futures-util.workspace = true
+nix.workspace = true
 serde.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

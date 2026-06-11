@@ -1,21 +1,18 @@
-//! RustKube CLI. Phase 2 brings `apply`, `get` (with `--watch`), `describe`
-//! and `delete` over the API server's REST surface; `logs` needs the node
-//! agent (Phase 3), `scale` the controllers (Phase 5), `drain` Phase 8 — no
-//! dead flags in the meantime.
+//! RustKube CLI. `apply`, `get` (with `--watch`), `describe` and `delete`
+//! ride the shared API client in `rk_types::client`; `logs` needs the node
+//! agent's log streaming (Phase 7), `scale` the controllers (Phase 5),
+//! `drain` Phase 8 — no dead flags in the meantime.
 
-mod client;
 mod output;
-mod sse;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rk_types::{EventType, ResourceKind, WatchEvent};
+use futures_util::StreamExt as _;
+use rk_types::client::ApiClient;
+use rk_types::{EventType, ResourceKind};
 use serde_json::Value;
-
-use crate::client::ApiClient;
 
 #[derive(Debug, Parser)]
 #[command(name = "rk-ctl", version, about = "RustKube CLI")]
@@ -42,7 +39,7 @@ enum Command {
     },
     /// List resources, or show one by name.
     Get {
-        /// Resource kind: `pods`, `pod`, `configmaps`, ...
+        /// Resource kind: `pods`, `pod`, `nodes`, `configmaps`, ...
         kind: String,
         /// Object name; omit to list.
         name: Option<String>,
@@ -193,10 +190,10 @@ async fn apply(api_url: &str, files: &[PathBuf]) -> anyhow::Result<()> {
 
         for mut object in objects {
             let (kind, namespace, name) = manifest_identity(&object)?;
-            let current = client.get_item(kind, namespace.as_deref(), &name).await?;
+            let current = client.get_raw(kind, namespace.as_deref(), &name).await?;
             match current {
                 None => {
-                    client.create(kind, &object).await?;
+                    client.create_raw(kind, &object).await?;
                     print_line(&format!("{}/{name} created", kind.as_str().to_lowercase()));
                 }
                 Some(current) => {
@@ -212,7 +209,7 @@ async fn apply(api_url: &str, files: &[PathBuf]) -> anyhow::Result<()> {
                         meta.insert("resourceVersion".to_owned(), rv.clone());
                     }
                     client
-                        .update(kind, namespace.as_deref(), &name, &object)
+                        .replace_raw(kind, namespace.as_deref(), &name, &object)
                         .await?;
                     print_line(&format!(
                         "{}/{name} configured",
@@ -247,7 +244,7 @@ async fn get(
 
     if let Some(name) = name {
         let object = client
-            .get_item(kind, effective_ns, name)
+            .get_raw(kind, effective_ns, name)
             .await?
             .with_context(|| format!("{kind} {name:?} not found"))?;
         match format {
@@ -264,7 +261,7 @@ async fn get(
         return Ok(());
     }
 
-    let list = client.list(kind, effective_ns).await?;
+    let list = client.list_raw(kind, effective_ns).await?;
     match format {
         Some(OutputFormat::Yaml) => print_line(serde_yaml::to_string(&list.items)?.trim_end()),
         Some(OutputFormat::Json) => print_line(&serde_json::to_string_pretty(&list.items)?),
@@ -288,20 +285,19 @@ async fn get(
 
     if watch {
         let since = list.resource_version.unwrap_or(0);
-        client
-            .watch(kind, effective_ns, since, |event: WatchEvent<Value>| {
-                let now = chrono::Utc::now();
-                let mut row = output::row(kind, &event.object, wide_ns, now);
-                let tag = match event.event_type {
-                    EventType::Added => "ADDED",
-                    EventType::Modified => "MODIFIED",
-                    EventType::Deleted => "DELETED",
-                };
-                row.insert(0, tag.to_owned());
-                print_line(&row.join("   "));
-                Ok(())
-            })
-            .await?;
+        let mut stream = client.watch_raw(kind, effective_ns, since).await?;
+        while let Some(item) = stream.next().await {
+            let event = item?;
+            let now = chrono::Utc::now();
+            let mut row = output::row(kind, &event.object, wide_ns, now);
+            let tag = match event.event_type {
+                EventType::Added => "ADDED",
+                EventType::Modified => "MODIFIED",
+                EventType::Deleted => "DELETED",
+            };
+            row.insert(0, tag.to_owned());
+            print_line(&row.join("   "));
+        }
         bail!("watch stream ended (the server cut a lagging watch); re-run to resume");
     }
     Ok(())
@@ -317,7 +313,7 @@ async fn describe(
     let client = ApiClient::new(api_url)?;
     let ns = kind.namespaced().then(|| namespace.unwrap_or("default"));
     let object = client
-        .get_item(kind, ns, name)
+        .get_raw(kind, ns, name)
         .await?
         .with_context(|| format!("{kind} {name:?} not found"))?;
     print_line(&format!(
@@ -337,7 +333,7 @@ async fn delete(
     let kind = parse_kind(kind)?;
     let client = ApiClient::new(api_url)?;
     let ns = kind.namespaced().then(|| namespace.unwrap_or("default"));
-    client.delete(kind, ns, name).await?;
+    client.delete_raw(kind, ns, name).await?;
     print_line(&format!(
         "{} \"{name}\" deleted",
         kind.as_str().to_lowercase()
@@ -347,20 +343,13 @@ async fn delete(
 
 async fn version(api_url: &str) -> anyhow::Result<()> {
     print_line(&format!("client: rk-ctl v{}", env!("CARGO_PKG_VERSION")));
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
-    match client.get(format!("{api_url}/version")).send().await {
-        Ok(response) if response.status().is_success() => {
-            let info: serde_json::Value = response.json().await?;
-            print_line(&format!(
-                "server: {} v{}",
-                info["component"].as_str().unwrap_or("<unknown>"),
-                info["version"].as_str().unwrap_or("<unknown>"),
-            ));
-        }
-        Ok(response) => print_line(&format!("server: error ({})", response.status())),
+    let client = ApiClient::new(api_url)?;
+    match client.server_version().await {
+        Ok(info) => print_line(&format!(
+            "server: {} v{}",
+            info["component"].as_str().unwrap_or("<unknown>"),
+            info["version"].as_str().unwrap_or("<unknown>"),
+        )),
         Err(_) => print_line(&format!("server: unreachable at {api_url}")),
     }
     Ok(())
