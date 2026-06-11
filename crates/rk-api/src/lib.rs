@@ -1,8 +1,14 @@
 //! RustKube control-plane API server.
 //!
-//! Phase 0 stands up the axum stack with `/healthz` and `/version`; Phase 2
-//! adds the resource CRUD endpoints, validation, optimistic concurrency and
-//! the watch stream on top of `rk-store`.
+//! REST CRUD for every resource kind ([`resources`]), validation against the
+//! typed model, optimistic concurrency via `metadata.resourceVersion`, and a
+//! Server-Sent-Events watch stream ([`watch`]) — all over an [`rk_store`]
+//! backend ([`rk_store::SqliteStore`] in practice). The API server is the
+//! only component that touches the store; agents, controllers, the scheduler
+//! and the CLI all go through HTTP.
 
 pub mod config;
+pub mod error;
+pub mod resources;
 pub mod server;
+pub mod watch;

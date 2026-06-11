@@ -11,11 +11,15 @@
 //! by revision. Conditional writes (`expected_revision`) give the API server
 //! optimistic concurrency for resource versions.
 
+pub mod sqlite;
+
 use std::pin::Pin;
 
 use futures_core::Stream;
 use rk_types::ResourceKind;
 use serde::{Deserialize, Serialize};
+
+pub use sqlite::SqliteStore;
 
 /// A resource as the store sees it: identity, revision, and the full object
 /// as JSON. The store never interprets `data`.
@@ -51,6 +55,10 @@ pub enum StoreEventKind {
 #[derive(Debug, Clone)]
 pub struct StoreEvent {
     pub kind: StoreEventKind,
+    /// Revision the object had before this event — `None` means this event
+    /// created it. This is what lets the API layer map `Put` to
+    /// `ADDED`/`MODIFIED` without tracking object existence itself.
+    pub prior_revision: Option<u64>,
     pub object: StoredObject,
 }
 
@@ -76,8 +84,9 @@ pub enum StoreError {
 pub trait Store: Send + Sync + 'static {
     /// Insert or update an object. With `expected_revision: Some(rev)` the
     /// write only succeeds if the object's current revision is exactly `rev`
-    /// (optimistic concurrency); `None` writes unconditionally. Returns the
-    /// object stamped with its new revision.
+    /// (optimistic concurrency); `None` writes unconditionally. Revisions
+    /// start at 1, so `Some(0)` means "must not exist" — the create
+    /// primitive. Returns the object stamped with its new revision.
     async fn put(
         &self,
         object: StoredObject,

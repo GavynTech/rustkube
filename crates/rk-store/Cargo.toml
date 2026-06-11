@@ -14,3 +14,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
+futures-util.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

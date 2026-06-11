@@ -14,7 +14,7 @@ for the full specification.
 
 - [x] Phase 0 — workspace scaffold: all crates, shared types, config loading, logging, Makefile
 - [x] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
-- [ ] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
+- [x] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
 - [ ] Phase 3 — node agent (reconcile assigned pods, report status)
 - [ ] Phase 4 — multi-node + scheduler
 - [ ] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates)
@@ -27,7 +27,7 @@ for the full specification.
 | Crate | Kind | Role |
 |---|---|---|
 | `crates/rk-types` | lib | resource model (Pod, Deployment, …), quantities, config/tracing bootstrap |
-| `crates/rk-store` | lib | `Store` trait + event types; sqlite implementation arrives in Phase 2 |
+| `crates/rk-store` | lib | `Store` trait + the sqlite implementation (revisions, change log, watch fan-out) |
 | `crates/rk-api` | bin | control-plane API server (axum) |
 | `crates/rk-scheduler` | bin | pod → node placement |
 | `crates/rk-controllers` | bin | reconciliation loops |
@@ -36,21 +36,29 @@ for the full specification.
 | `crates/rk-agent` | bin | per-node kubelet equivalent |
 | `crates/rk-ctl` | bin | CLI |
 
-## Quickstart (Phase 0 scope)
+## Quickstart (Phase 2 scope)
 
 ```sh
 make build      # compile the whole workspace
 make test       # unit tests
 make clippy     # lint wall: -D warnings
 make dev-up     # start rk-api on 127.0.0.1:6443, wait for /healthz
-./target/debug/rk-ctl version
+
+rk-ctl apply -f examples/pod.yaml      # pod/web-0 created
+rk-ctl get pods                        # NAME  STATUS  NODE  AGE
+rk-ctl get pods --watch                # streams ADDED/MODIFIED/DELETED rows
+rk-ctl describe pod web-0              # full object as YAML
+rk-ctl delete pod web-0
+
 make dev-down
-make e2e        # scripted end-to-end smoke test
+make e2e        # scripted end-to-end test of all of the above
 ```
 
-`RUST_LOG` controls verbosity (e.g. `RUST_LOG=debug make dev-up`). Component
-config files live in `config/<component>.yaml`; an explicit `--config <path>`
-or `RK_CONFIG=<path>` overrides the default search.
+(`rk-ctl` is `./target/debug/rk-ctl`; `alias rk-ctl=$PWD/target/debug/rk-ctl`
+makes the above read as written.) `RUST_LOG` controls verbosity (e.g.
+`RUST_LOG=debug make dev-up`). Component config files live in
+`config/<component>.yaml`; an explicit `--config <path>` or
+`RK_CONFIG=<path>` overrides the default search.
 
 ## Container runner (Phase 1 scope)
 

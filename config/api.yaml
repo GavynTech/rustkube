@@ -1,2 +1,3 @@
 # rk-api dev config. Loopback only — see SPEC.md before exposing anything.
 listenAddr: "127.0.0.1:6443"
+dbPath: ".dev/rustkube.db"

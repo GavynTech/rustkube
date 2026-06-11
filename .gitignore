@@ -11,3 +11,8 @@
 .idea/
 *.swp
 .DS_Store
+
+# sqlite store (default path when run without config)
+*.db
+*.db-shm
+*.db-wal
