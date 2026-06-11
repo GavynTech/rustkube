@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# RustKube dev-cluster state (pids, logs, agent data)
+/.dev/
+*.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

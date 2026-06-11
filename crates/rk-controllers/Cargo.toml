@@ -1,0 +1,18 @@
+[package]
+name = "rk-controllers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rk-types.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_yaml.workspace = true

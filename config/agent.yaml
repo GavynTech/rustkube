@@ -1,0 +1,4 @@
+# rk-agent dev config. dataDir is kept inside the repo for dev so nothing
+# touches /var/lib; production uses /etc/rustkube/agent.yaml with the default.
+apiUrl: "http://127.0.0.1:6443"
+dataDir: ".dev/agent"
