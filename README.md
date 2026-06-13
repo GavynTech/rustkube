@@ -17,7 +17,7 @@ for the full specification.
 - [x] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
 - [x] Phase 3 — node agent (reconcile assigned pods, report status)
 - [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
-- [ ] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates)
+- [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [ ] Phase 6 — networking (bridge/veth, VXLAN, service VIPs, DNS)
 - [ ] Phase 7 — ingress + probes + logs + the website workload
 - [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
@@ -30,7 +30,7 @@ for the full specification.
 | `crates/rk-store` | lib | `Store` trait + the sqlite implementation (revisions, change log, watch fan-out) |
 | `crates/rk-api` | bin | control-plane API server (axum) |
 | `crates/rk-scheduler` | bin | pod → node placement (filter + most-allocated bin packing, nodeSelector) |
-| `crates/rk-controllers` | bin | reconciliation loops |
+| `crates/rk-controllers` | bin | Deployment/ReplicaSet/Node controllers + owner-ref GC |
 | `crates/rk-runtime` | lib | OCI image + container lifecycle |
 | `crates/rk-net` | lib | bridge/veth/VXLAN, IPAM, service VIPs, DNS |
 | `crates/rk-agent` | bin | per-node kubelet equivalent |
@@ -101,6 +101,27 @@ rk-ctl describe pod huge         # status.message: 0/2 nodes available: 2 Insuff
 `nodeSelector` steering, an unschedulable pod, and pods actually running on
 each node in its own pod network (design notes in
 [docs/phase-4-notes.md](docs/phase-4-notes.md)).
+
+## Controllers (Phase 5 scope)
+
+`rk-controllers` reconciles the workload resources: a Deployment owns a
+ReplicaSet per template revision, a ReplicaSet keeps N pods alive, and a Node
+controller marks dead nodes and reschedules their pods. Owner-reference
+garbage collection makes deletes cascade.
+
+```sh
+rk-ctl apply -f examples/deployment.yaml   # Deployment → ReplicaSet → 3 Pods
+rk-ctl get deployments                     # web   3/3   3   3
+rk-ctl get rs                              # web-<hash>  3  3  3
+rk-ctl delete pod <one>                    # the ReplicaSet recreates it
+rk-ctl scale deployment web --replicas=5   # two more pods appear
+# edit the image/template and re-apply → a rolling update (maxUnavailable/maxSurge)
+rk-ctl delete deployment web               # GC removes its ReplicaSets, then Pods
+```
+
+`scripts/phase5-demo.sh` runs the lot on the two-node VM cluster: deploy,
+self-heal, scale up/down, a rolling update, node-death rescheduling, and
+cascade delete (design notes in [docs/phase-5-notes.md](docs/phase-5-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

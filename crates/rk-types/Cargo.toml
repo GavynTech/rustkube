@@ -8,9 +8,10 @@ license.workspace = true
 workspace = true
 
 [features]
-# The HTTP/watch client for talking to rk-api (agent, scheduler, controllers,
-# CLI). Off by default so pure-types consumers don't build reqwest.
-client = ["dep:reqwest", "dep:futures-core", "dep:futures-util"]
+# The HTTP/watch client + the list/watch reflector for talking to rk-api
+# (agent, scheduler, controllers, CLI). Off by default so pure-types consumers
+# don't build reqwest/tokio.
+client = ["dep:reqwest", "dep:futures-core", "dep:futures-util", "dep:tokio"]
 
 [dependencies]
 serde.workspace = true
@@ -25,6 +26,7 @@ base64.workspace = true
 reqwest = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

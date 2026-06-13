@@ -160,16 +160,36 @@ impl fmt::Display for ResourceKind {
 #[error("unknown resource kind {0:?}")]
 pub struct KindParseError(pub String);
 
+impl ResourceKind {
+    /// kubectl-style short aliases, so `rk-ctl get rs` and `scale deploy`
+    /// work like the real thing.
+    fn from_alias(lower: &str) -> Option<ResourceKind> {
+        Some(match lower {
+            "po" => ResourceKind::Pod,
+            "rs" => ResourceKind::ReplicaSet,
+            "deploy" => ResourceKind::Deployment,
+            "svc" => ResourceKind::Service,
+            "ing" => ResourceKind::Ingress,
+            "no" => ResourceKind::Node,
+            "ns" => ResourceKind::Namespace,
+            "cm" => ResourceKind::ConfigMap,
+            _ => return None,
+        })
+    }
+}
+
 impl FromStr for ResourceKind {
     type Err = KindParseError;
 
-    /// Accepts the canonical kind (`Pod`), the plural (`pods`) and any casing,
-    /// so `rk-ctl get pods` and YAML `kind: Pod` both resolve.
+    /// Accepts the canonical kind (`Pod`), the plural (`pods`), kubectl short
+    /// aliases (`rs`, `deploy`), and any casing — so `rk-ctl get pods`, `get
+    /// rs` and YAML `kind: Pod` all resolve.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.to_ascii_lowercase();
         ResourceKind::ALL
             .into_iter()
             .find(|kind| lower == kind.as_str().to_ascii_lowercase() || lower == kind.plural())
+            .or_else(|| ResourceKind::from_alias(&lower))
             .ok_or_else(|| KindParseError(s.to_owned()))
     }
 }
@@ -207,6 +227,19 @@ mod tests {
         assert_eq!(
             "REPLICASETS".parse::<ResourceKind>().unwrap(),
             ResourceKind::ReplicaSet
+        );
+        // kubectl short aliases resolve too.
+        assert_eq!(
+            "rs".parse::<ResourceKind>().unwrap(),
+            ResourceKind::ReplicaSet
+        );
+        assert_eq!(
+            "deploy".parse::<ResourceKind>().unwrap(),
+            ResourceKind::Deployment
+        );
+        assert_eq!(
+            "svc".parse::<ResourceKind>().unwrap(),
+            ResourceKind::Service
         );
         assert!("Gizmo".parse::<ResourceKind>().is_err());
     }

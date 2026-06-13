@@ -72,10 +72,33 @@ pub fn headers(kind: ResourceKind, with_namespace: bool) -> Vec<&'static str> {
     match kind {
         ResourceKind::Pod => headers.extend(["STATUS", "RESTARTS", "IP", "NODE"]),
         ResourceKind::Node => headers.push("STATUS"),
+        ResourceKind::Deployment => headers.extend(["READY", "UP-TO-DATE", "AVAILABLE"]),
+        ResourceKind::ReplicaSet => headers.extend(["DESIRED", "CURRENT", "READY"]),
         _ => {}
     }
     headers.push("AGE");
     headers
+}
+
+/// `<ready>/<desired>` the way kubectl renders workload readiness.
+fn ready_fraction(object: &Value, desired_ptr: &str) -> String {
+    let desired = object
+        .pointer(desired_ptr)
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let ready = object
+        .pointer("/status/readyReplicas")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    format!("{ready}/{desired}")
+}
+
+fn u64_field(object: &Value, pointer: &str) -> String {
+    object
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .to_string()
 }
 
 /// A pod's display status: the waiting reason when a container is stuck
@@ -149,6 +172,16 @@ pub fn row(
                     .unwrap_or("Unknown")
                     .to_owned(),
             );
+        }
+        ResourceKind::Deployment => {
+            row.push(ready_fraction(object, "/spec/replicas"));
+            row.push(u64_field(object, "/status/updatedReplicas"));
+            row.push(u64_field(object, "/status/readyReplicas"));
+        }
+        ResourceKind::ReplicaSet => {
+            row.push(u64_field(object, "/spec/replicas"));
+            row.push(u64_field(object, "/status/replicas"));
+            row.push(u64_field(object, "/status/readyReplicas"));
         }
         _ => {}
     }
@@ -265,6 +298,35 @@ mod tests {
             headers(ResourceKind::Node, false),
             vec!["NAME", "STATUS", "AGE"]
         );
+        assert_eq!(
+            headers(ResourceKind::Deployment, false),
+            vec!["NAME", "READY", "UP-TO-DATE", "AVAILABLE", "AGE"]
+        );
+        assert_eq!(headers(ResourceKind::ReplicaSet, false).len(), 5);
         assert_eq!(headers(ResourceKind::ConfigMap, false), vec!["NAME", "AGE"]);
+    }
+
+    #[test]
+    fn workload_rows_show_replica_fractions() {
+        let now = Utc::now();
+        let deploy = serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": { "replicas": 3 },
+            "status": { "replicas": 3, "updatedReplicas": 2, "readyReplicas": 2 }
+        });
+        assert_eq!(
+            row(ResourceKind::Deployment, &deploy, false, now),
+            vec!["web", "2/3", "2", "2", "<unknown>"]
+        );
+
+        let rs = serde_json::json!({
+            "metadata": { "name": "web-abc12" },
+            "spec": { "replicas": 3 },
+            "status": { "replicas": 3, "readyReplicas": 1 }
+        });
+        assert_eq!(
+            row(ResourceKind::ReplicaSet, &rs, false, now),
+            vec!["web-abc12", "3", "3", "1", "<unknown>"]
+        );
     }
 }

@@ -69,6 +69,16 @@ enum Command {
         #[arg(short = 'n', long)]
         namespace: Option<String>,
     },
+    /// Set the replica count of a Deployment or ReplicaSet.
+    Scale {
+        /// `deployment`/`deploy` or `replicaset`/`rs`.
+        kind: String,
+        name: String,
+        #[arg(long)]
+        replicas: u32,
+        #[arg(short = 'n', long)]
+        namespace: Option<String>,
+    },
     /// Print the client version and, when reachable, the server version.
     Version,
 }
@@ -113,6 +123,12 @@ async fn main() -> anyhow::Result<()> {
             name,
             namespace,
         } => delete(&cli.api_url, &kind, &name, namespace.as_deref()).await,
+        Command::Scale {
+            kind,
+            name,
+            replicas,
+            namespace,
+        } => scale(&cli.api_url, &kind, &name, replicas, namespace.as_deref()).await,
         Command::Version => version(&cli.api_url).await,
     }
 }
@@ -336,6 +352,34 @@ async fn delete(
     client.delete_raw(kind, ns, name).await?;
     print_line(&format!(
         "{} \"{name}\" deleted",
+        kind.as_str().to_lowercase()
+    ));
+    Ok(())
+}
+
+async fn scale(
+    api_url: &str,
+    kind: &str,
+    name: &str,
+    replicas: u32,
+    namespace: Option<&str>,
+) -> anyhow::Result<()> {
+    let kind = parse_kind(kind)?;
+    if !matches!(kind, ResourceKind::Deployment | ResourceKind::ReplicaSet) {
+        bail!("can only scale Deployments and ReplicaSets, not {kind}");
+    }
+    let client = ApiClient::new(api_url)?;
+    let ns = namespace.unwrap_or("default");
+    // Read-modify-write the existing object at its current resourceVersion;
+    // the server enforces the optimistic-concurrency check.
+    let mut object = client
+        .get_raw(kind, Some(ns), name)
+        .await?
+        .with_context(|| format!("{kind} {name:?} not found"))?;
+    object["spec"]["replicas"] = replicas.into();
+    client.replace_raw(kind, Some(ns), name, &object).await?;
+    print_line(&format!(
+        "{} \"{name}\" scaled to {replicas}",
         kind.as_str().to_lowercase()
     ));
     Ok(())
