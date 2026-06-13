@@ -68,13 +68,24 @@ async fn run_agent() -> anyhow::Result<()> {
             .to_string_lossy()
             .into_owned(),
     };
-    let capacity = node::detect_capacity()?;
+
+    // Advertised capacity: the detected machine resources, with optional dev
+    // overrides (netns-simulated nodes share the host's real cpu/memory, so
+    // overrides are what make resource-based scheduling demonstrable).
+    let mut capacity = node::detect_capacity()?;
+    if let Some(cpu) = config.capacity_cpu {
+        capacity.cpu = Some(cpu);
+    }
+    if let Some(memory) = config.capacity_memory {
+        capacity.memory = Some(memory);
+    }
     let address = config.node_ip.or_else(node::detect_node_ip);
     info!(
         version = env!("CARGO_PKG_VERSION"),
         api_url = %config.api_url,
         node = %node_name,
         address = ?address,
+        pod_cidr = config.pod_cidr.as_deref().unwrap_or("10.42.0.0/24 (default)"),
         data_dir = %config.data_dir.display(),
         "rk-agent starting"
     );
@@ -82,11 +93,23 @@ async fn run_agent() -> anyhow::Result<()> {
     let client = Arc::new(ApiClient::new(&config.api_url)?);
     let store = Store::new(&config.data_dir);
     store.ensure_layout()?;
+    if let Some(cidr) = &config.pod_cidr {
+        rk_runtime::net::configure_pod_cidr(&store, cidr)
+            .with_context(|| format!("configuring pod CIDR {cidr}"))?;
+    }
+
+    let registration = node::Registration {
+        name: node_name.clone(),
+        address,
+        capacity,
+        labels: config.node_labels.clone(),
+        pod_cidr: config.pod_cidr.clone(),
+    };
 
     // The API server may still be coming up; registration retries until it
     // answers, because nothing else can proceed without a Node.
     loop {
-        match node::register(&client, &node_name, address, &capacity).await {
+        match node::register(&client, &registration).await {
             Ok(()) => break,
             Err(err) => {
                 warn!(error = %format!("{err:#}"), "registration failed; retrying in 2s");
@@ -97,9 +120,7 @@ async fn run_agent() -> anyhow::Result<()> {
 
     tokio::spawn(node::heartbeat_loop(
         client.clone(),
-        node_name.clone(),
-        address,
-        capacity,
+        registration,
         config.heartbeat_interval_secs,
     ));
 

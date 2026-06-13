@@ -42,6 +42,9 @@ pub enum RuntimeError {
     #[error("invalid container name {name:?}: {reason}")]
     BadName { name: String, reason: &'static str },
 
+    #[error("invalid pod CIDR {cidr:?}: {reason}")]
+    BadPodCidr { cidr: String, reason: &'static str },
+
     #[error("container {name:?} already exists")]
     AlreadyExists { name: String },
 

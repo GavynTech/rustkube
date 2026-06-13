@@ -1,37 +1,16 @@
 //! RustKube scheduler: watches for pods with no `nodeName`, scores Ready
 //! nodes by free CPU/memory (resource-aware bin packing), honors
 //! `nodeSelector`, and writes the binding back through the API server.
-//! The scheduling loop itself lands in Phase 4.
+//!
+//! Split like the agent: [`schedule`] is the pure decision (filter + score),
+//! [`cache`] is a generic list+watch reflector over the API, and the binary's
+//! loop is the only impure glue. A pod with no node gets bound (`spec.nodeName`
+//! set); a pod nothing fits gets `status.message` explaining why — and since
+//! unscheduled pods have no owning agent, the scheduler can write that status
+//! without fighting anyone.
 
-use serde::Deserialize;
+pub mod cache;
+pub mod config;
+pub mod schedule;
 
-fn default_api_url() -> String {
-    "http://127.0.0.1:6443".to_owned()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SchedulerConfig {
-    pub api_url: String,
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        SchedulerConfig {
-            api_url: default_api_url(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_parses_and_defaults() {
-        let config: SchedulerConfig =
-            serde_yaml::from_str("apiUrl: http://10.0.0.1:6443\n").unwrap();
-        assert_eq!(config.api_url, "http://10.0.0.1:6443");
-        assert_eq!(SchedulerConfig::default().api_url, "http://127.0.0.1:6443");
-    }
-}
+pub use config::SchedulerConfig;

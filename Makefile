@@ -24,8 +24,10 @@ test:
 e2e:
 	./scripts/e2e.sh
 
-# Phase 0 dev cluster = the API server. The agent, scheduler and controllers
-# join dev-up as their loops land in Phases 3-5.
+# Dev cluster on the workstation = the unprivileged control plane: the API
+# server and the scheduler. The node agent needs root + real namespaces, so
+# it runs on the Ubuntu VM via scripts/phase3-demo.sh and phase4-demo.sh; the
+# controllers join dev-up in Phase 5.
 dev-up: build
 	@mkdir -p .dev
 	@if [ -f .dev/api.pid ] && kill -0 $$(cat .dev/api.pid) 2>/dev/null; then \
@@ -39,15 +41,23 @@ dev-up: build
 		curl -fsS $(API_URL)/healthz > /dev/null || { echo "rk-api failed to start; see .dev/api.log"; exit 1; }; \
 		echo "rk-api up at $(API_URL) (pid $$(cat .dev/api.pid), log .dev/api.log)"; \
 	fi
+	@if [ -f .dev/scheduler.pid ] && kill -0 $$(cat .dev/scheduler.pid) 2>/dev/null; then \
+		echo "rk-scheduler already running (pid $$(cat .dev/scheduler.pid))"; \
+	else \
+		RUST_LOG=$${RUST_LOG:-info} nohup ./target/debug/rk-scheduler > .dev/scheduler.log 2>&1 & echo $$! > .dev/scheduler.pid; \
+		echo "rk-scheduler up (pid $$(cat .dev/scheduler.pid), log .dev/scheduler.log)"; \
+	fi
 
 dev-down:
-	@if [ -f .dev/api.pid ]; then \
-		kill $$(cat .dev/api.pid) 2>/dev/null || true; \
-		rm -f .dev/api.pid; \
-		echo "dev cluster stopped"; \
-	else \
-		echo "dev cluster is not running"; \
-	fi
+	@stopped=0; \
+	for c in scheduler api; do \
+		if [ -f .dev/$$c.pid ]; then \
+			kill $$(cat .dev/$$c.pid) 2>/dev/null || true; \
+			rm -f .dev/$$c.pid; \
+			echo "stopped rk-$$c"; stopped=1; \
+		fi; \
+	done; \
+	[ $$stopped -eq 1 ] || echo "dev cluster is not running"
 
 clean:
 	cargo clean

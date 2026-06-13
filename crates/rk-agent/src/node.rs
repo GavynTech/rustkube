@@ -3,6 +3,7 @@
 //! fresh heartbeat timestamp every interval. The node controller (Phase 5)
 //! is what turns *missed* heartbeats into NotReady and rescheduling.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -54,33 +55,49 @@ pub fn detect_node_ip() -> Option<IpAddr> {
     None
 }
 
-fn ready_status(node: &mut Node, address: Option<IpAddr>, capacity: &ResourceList) {
+/// Everything the agent advertises about its node, fixed for the process
+/// lifetime — passed once to [`register`] and the [`heartbeat_loop`].
+#[derive(Debug, Clone)]
+pub struct Registration {
+    pub name: String,
+    pub address: Option<IpAddr>,
+    pub capacity: ResourceList,
+    pub labels: BTreeMap<String, String>,
+    pub pod_cidr: Option<String>,
+}
+
+fn ready_status(node: &mut Node, reg: &Registration) {
     node.status.condition = NodeCondition::Ready;
-    node.status.capacity = *capacity;
-    node.status.allocatable = *capacity;
-    node.status.address = address;
+    node.status.capacity = reg.capacity;
+    node.status.allocatable = reg.capacity;
+    node.status.address = reg.address;
     node.status.last_heartbeat = Some(chrono::Utc::now());
 }
 
+fn apply_identity(node: &mut Node, reg: &Registration) {
+    for (key, value) in &reg.labels {
+        node.metadata.labels.insert(key.clone(), value.clone());
+    }
+    node.metadata
+        .labels
+        .insert("rustkube.io/hostname".to_owned(), reg.name.clone());
+    if let Some(cidr) = &reg.pod_cidr {
+        node.spec.pod_cidr = Some(cidr.clone());
+    }
+}
+
 /// Create the Node, or refresh it if a previous agent run left one behind.
-pub async fn register(
-    client: &ApiClient,
-    name: &str,
-    address: Option<IpAddr>,
-    capacity: &ResourceList,
-) -> anyhow::Result<()> {
-    let existing: Option<Node> = client.get(None, name).await?;
+pub async fn register(client: &ApiClient, reg: &Registration) -> anyhow::Result<()> {
+    let existing: Option<Node> = client.get(None, &reg.name).await?;
     let mut node = existing.unwrap_or_else(|| Node {
         api_version: "v1".to_owned(),
         kind: "Node".to_owned(),
-        metadata: ObjectMeta::named(name),
+        metadata: ObjectMeta::named(&reg.name),
         spec: Default::default(),
         status: Default::default(),
     });
-    node.metadata
-        .labels
-        .insert("rustkube.io/hostname".to_owned(), name.to_owned());
-    ready_status(&mut node, address, capacity);
+    apply_identity(&mut node, reg);
+    ready_status(&mut node, reg);
 
     let result = if node.metadata.resource_version.is_some() {
         client.replace(&node).await
@@ -89,7 +106,7 @@ pub async fn register(
     };
     match result {
         Ok(_) => {
-            tracing::info!(node = name, "node registered");
+            tracing::info!(node = %reg.name, "node registered");
             Ok(())
         }
         // Another registration won the race; the heartbeat loop refreshes it.
@@ -100,21 +117,15 @@ pub async fn register(
 
 /// Re-assert Ready forever. Errors are logged and retried next tick; a
 /// missing Node (someone deleted it) is re-registered.
-pub async fn heartbeat_loop(
-    client: Arc<ApiClient>,
-    name: String,
-    address: Option<IpAddr>,
-    capacity: ResourceList,
-    interval_secs: u64,
-) {
+pub async fn heartbeat_loop(client: Arc<ApiClient>, reg: Registration, interval_secs: u64) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         let result: anyhow::Result<()> = async {
-            match client.get::<Node>(None, &name).await? {
+            match client.get::<Node>(None, &reg.name).await? {
                 Some(mut node) => {
-                    ready_status(&mut node, address, &capacity);
+                    ready_status(&mut node, &reg);
                     match client.replace(&node).await {
                         Ok(_) => Ok(()),
                         // Lost a write race; the next tick wins or loses again.
@@ -122,7 +133,7 @@ pub async fn heartbeat_loop(
                         Err(err) => Err(err.into()),
                     }
                 }
-                None => register(&client, &name, address, &capacity).await,
+                None => register(&client, &reg).await,
             }
         }
         .await;

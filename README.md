@@ -16,7 +16,7 @@ for the full specification.
 - [x] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
 - [x] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
 - [x] Phase 3 — node agent (reconcile assigned pods, report status)
-- [ ] Phase 4 — multi-node + scheduler
+- [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
 - [ ] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates)
 - [ ] Phase 6 — networking (bridge/veth, VXLAN, service VIPs, DNS)
 - [ ] Phase 7 — ingress + probes + logs + the website workload
@@ -29,7 +29,7 @@ for the full specification.
 | `crates/rk-types` | lib | resource model (Pod, Deployment, …), quantities, config/tracing bootstrap |
 | `crates/rk-store` | lib | `Store` trait + the sqlite implementation (revisions, change log, watch fan-out) |
 | `crates/rk-api` | bin | control-plane API server (axum) |
-| `crates/rk-scheduler` | bin | pod → node placement |
+| `crates/rk-scheduler` | bin | pod → node placement (filter + most-allocated bin packing, nodeSelector) |
 | `crates/rk-controllers` | bin | reconciliation loops |
 | `crates/rk-runtime` | lib | OCI image + container lifecycle |
 | `crates/rk-net` | lib | bridge/veth/VXLAN, IPAM, service VIPs, DNS |
@@ -80,6 +80,27 @@ rk-ctl delete pod web-0
 `scripts/phase3-demo.sh` runs the full loop — registration, pull, run, curl,
 kill-and-self-heal, run-to-completion, teardown (design notes in
 [docs/phase-3-notes.md](docs/phase-3-notes.md)).
+
+## Multi-node + scheduler (Phase 4 scope)
+
+`rk-scheduler` watches for unbound pods and places them by free CPU/memory
+(most-allocated bin packing) and `nodeSelector`, writing the binding back; a
+pod that fits nowhere is left Pending with the reason in its status. On the
+VM, a second node is simulated as an agent in its own network namespace
+(`scripts/sim-node.sh`), each node carving pods from its own /24:
+
+```sh
+rk-ctl get nodes                 # rk-node1 Ready / rk-node2 Ready
+rk-ctl apply -f some-pods.yaml   # no nodeName — the scheduler assigns one
+rk-ctl get pods                  # NODE column shows the placement
+# a pod requesting more than any node has stays Pending:
+rk-ctl describe pod huge         # status.message: 0/2 nodes available: 2 Insufficient cpu
+```
+
+`scripts/phase4-demo.sh` brings up both nodes and demonstrates bin packing,
+`nodeSelector` steering, an unschedulable pod, and pods actually running on
+each node in its own pod network (design notes in
+[docs/phase-4-notes.md](docs/phase-4-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

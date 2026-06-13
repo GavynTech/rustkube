@@ -1,11 +1,13 @@
 //! Phase 1 networking: one veth pair per container, host end in the host
 //! namespace, peer renamed `eth0` inside the container's netns.
 //!
-//! Each container gets a /30 carved from `10.42.0.0/24` (host = .1 of the
-//! block, container = .2), so the VM host curls the container IP over the
-//! connected route on the veth — no bridge, no NAT, no DNS yet. The real
-//! pod network (bridge + VXLAN + service VIPs) replaces this in Phase 6;
-//! outbound traffic from the container is intentionally out of scope here.
+//! Each container gets a /30 carved from this data dir's pod /24 (host = .1
+//! of the block, container = .2), so the node curls the container IP over the
+//! connected route on the veth — no bridge, no NAT, no DNS yet. The /24 base
+//! defaults to `10.42.0.0/24` (Phase 1 `rkrt`) and is set per node by the
+//! agent ([`configure_pod_cidr`]) from Phase 4, so simulated nodes don't
+//! collide. The real cross-node pod network (bridge + VXLAN + service VIPs)
+//! replaces this in Phase 6; outbound container traffic is out of scope here.
 //!
 //! Configuring the inside of the netns uses the standard setns trick: a
 //! scratch thread joins the container's network namespace (threads carry
@@ -23,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, RuntimeError};
 use crate::store::Store;
 
-/// Base of the /24 the /30 blocks are carved from.
+/// Default /24 the /30 blocks are carved from when no pod CIDR is configured.
 const POD_NET_BASE: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 0);
 /// 64 /30 blocks fit in the /24; block 0 is kept aside so .0/.1 never collide
 /// with anything that assumes a network address.
@@ -36,14 +38,14 @@ pub struct PodNet {
     pub container_ip: Ipv4Addr,
 }
 
-/// `(host, container)` addresses of a /30 block: network + 1 and + 2.
-fn block_ips(block: u32) -> (Ipv4Addr, Ipv4Addr) {
-    let base = u32::from(POD_NET_BASE) + block * 4;
-    (Ipv4Addr::from(base + 1), Ipv4Addr::from(base + 2))
+/// `(host, container)` addresses of a /30 block within `base`: net + 1 and + 2.
+fn block_ips(base: Ipv4Addr, block: u32) -> (Ipv4Addr, Ipv4Addr) {
+    let net = u32::from(base) + block * 4;
+    (Ipv4Addr::from(net + 1), Ipv4Addr::from(net + 2))
 }
 
-fn pod_net(block: u32) -> PodNet {
-    let (host_ip, container_ip) = block_ips(block);
+fn pod_net(base: Ipv4Addr, block: u32) -> PodNet {
+    let (host_ip, container_ip) = block_ips(base, block);
     PodNet {
         block,
         host_ip,
@@ -53,8 +55,16 @@ fn pod_net(block: u32) -> PodNet {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct IpamState {
+    /// The /24 network address pods are carved from; `None` means the
+    /// 10.42.0.0/24 default (preserves `rkrt`'s Phase 1 behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<Ipv4Addr>,
     next: u32,
     free: Vec<u32>,
+}
+
+fn base_of(state: &IpamState) -> Ipv4Addr {
+    state.base.unwrap_or(POD_NET_BASE)
 }
 
 fn read_ipam(store: &Store) -> Result<IpamState> {
@@ -75,11 +85,54 @@ fn write_ipam(store: &Store, state: &IpamState) -> Result<()> {
         .map_err(|source| RuntimeError::io("writing ipam state", &path, source))
 }
 
-/// Hand out the lowest free /30 block. Freed blocks are reused before new
-/// ones are cut. Single-writer by construction (one rkrt invocation at a
-/// time drives mutations) — good enough until the agent owns this in Phase 3.
+/// Pin the /24 this data dir allocates pod IPs from (e.g. `10.42.1.0/24`).
+/// Called once at node-agent startup so simulated nodes don't alias each
+/// other's pod IPs. Idempotent for the same CIDR; changing it once blocks
+/// are live is refused (it would re-home addresses already in use). `rkrt`
+/// never calls this and keeps the 10.42.0.0/24 default.
+pub fn configure_pod_cidr(store: &Store, cidr: &str) -> Result<()> {
+    let base = parse_slash24(cidr)?;
+    store.ensure_layout()?;
+    let mut state = read_ipam(store)?;
+    if base_of(&state) == base {
+        state.base = Some(base); // pin it even if it equalled the default
+        return write_ipam(store, &state);
+    }
+    if state.next > 0 || !state.free.is_empty() {
+        return Err(RuntimeError::BadPodCidr {
+            cidr: cidr.to_owned(),
+            reason: "data dir already has pod IP allocations under a different CIDR",
+        });
+    }
+    state.base = Some(base);
+    write_ipam(store, &state)
+}
+
+/// Parse `a.b.c.d/24` to its /24 network address. Only /24 is supported
+/// (each node owns exactly one /24, 63 usable /30 pod blocks).
+fn parse_slash24(cidr: &str) -> Result<Ipv4Addr> {
+    let bad = |reason| RuntimeError::BadPodCidr {
+        cidr: cidr.to_owned(),
+        reason,
+    };
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| bad("expected a.b.c.d/24"))?;
+    let addr: Ipv4Addr = addr.parse().map_err(|_| bad("invalid IPv4 address"))?;
+    if prefix.trim() != "24" {
+        return Err(bad("only /24 pod CIDRs are supported"));
+    }
+    // Mask to the /24 network address so `10.42.1.0/24` and `10.42.1.7/24`
+    // both normalize to 10.42.1.0.
+    Ok(Ipv4Addr::from(u32::from(addr) & 0xFFFF_FF00))
+}
+
+/// Hand out the lowest free /30 block from this data dir's /24. Freed blocks
+/// are reused before new ones are cut. Single-writer by construction (one
+/// agent owns one data dir).
 pub fn allocate(store: &Store) -> Result<PodNet> {
     let mut state = read_ipam(store)?;
+    let base = base_of(&state);
     let block = if let Some(block) = state.free.pop() {
         block
     } else {
@@ -91,7 +144,7 @@ pub fn allocate(store: &Store) -> Result<PodNet> {
         state.next
     };
     write_ipam(store, &state)?;
-    Ok(pod_net(block))
+    Ok(pod_net(base, block))
 }
 
 pub fn release(store: &Store, block: u32) -> Result<()> {
@@ -295,10 +348,54 @@ mod tests {
             (62, "10.42.0.249", "10.42.0.250"),
         ];
         for (block, host, container) in cases {
-            let net = pod_net(block);
+            let net = pod_net(POD_NET_BASE, block);
             assert_eq!(net.host_ip.to_string(), host, "block {block}");
             assert_eq!(net.container_ip.to_string(), container, "block {block}");
         }
+    }
+
+    #[test]
+    fn pod_cidr_shifts_the_whole_24() {
+        let base = parse_slash24("10.42.7.0/24").unwrap();
+        let net = pod_net(base, 1);
+        assert_eq!(net.host_ip.to_string(), "10.42.7.5");
+        assert_eq!(net.container_ip.to_string(), "10.42.7.6");
+    }
+
+    #[test]
+    fn parse_slash24_normalizes_and_validates() {
+        assert_eq!(
+            parse_slash24("10.42.3.0/24").unwrap(),
+            Ipv4Addr::new(10, 42, 3, 0)
+        );
+        // Host bits are masked off.
+        assert_eq!(
+            parse_slash24("10.42.3.77/24").unwrap(),
+            Ipv4Addr::new(10, 42, 3, 0)
+        );
+        for bad in [
+            "10.42.3.0",
+            "10.42.3.0/16",
+            "not-an-ip/24",
+            "10.42.3.0/24/8",
+        ] {
+            assert!(parse_slash24(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn configure_pod_cidr_pins_then_allocates_from_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        store.ensure_layout().unwrap();
+
+        configure_pod_cidr(&store, "10.42.5.0/24").unwrap();
+        let net = allocate(&store).unwrap();
+        assert_eq!(net.container_ip.to_string(), "10.42.5.6");
+
+        // Re-pinning the same CIDR is fine; a different one with live blocks is not.
+        configure_pod_cidr(&store, "10.42.5.0/24").unwrap();
+        assert!(configure_pod_cidr(&store, "10.42.9.0/24").is_err());
     }
 
     #[test]

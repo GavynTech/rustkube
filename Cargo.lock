@@ -2011,9 +2011,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "futures-util",
  "rk-types",
  "serde",
  "serde_yaml",
+ "tokio",
  "tracing",
 ]
 
