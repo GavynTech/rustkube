@@ -69,6 +69,12 @@ enum Command {
         #[arg(short = 'n', long)]
         namespace: Option<String>,
     },
+    /// Print a pod's container logs (fetched from the node running it).
+    Logs {
+        pod: String,
+        #[arg(short = 'n', long)]
+        namespace: Option<String>,
+    },
     /// Set the replica count of a Deployment or ReplicaSet.
     Scale {
         /// `deployment`/`deploy` or `replicaset`/`rs`.
@@ -123,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
             name,
             namespace,
         } => delete(&cli.api_url, &kind, &name, namespace.as_deref()).await,
+        Command::Logs { pod, namespace } => logs(&cli.api_url, &pod, namespace.as_deref()).await,
         Command::Scale {
             kind,
             name,
@@ -382,6 +389,51 @@ async fn scale(
         "{} \"{name}\" scaled to {replicas}",
         kind.as_str().to_lowercase()
     ));
+    Ok(())
+}
+
+/// Fetch a pod's logs from the node running it: resolve pod → nodeName →
+/// node address, then GET the node agent's log endpoint.
+async fn logs(api_url: &str, pod: &str, namespace: Option<&str>) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let client = ApiClient::new(api_url)?;
+    let ns = namespace.unwrap_or("default");
+    let pod_obj = client
+        .get_raw(ResourceKind::Pod, Some(ns), pod)
+        .await?
+        .with_context(|| format!("pod {pod:?} not found"))?;
+    let node_name = pod_obj
+        .pointer("/spec/nodeName")
+        .and_then(Value::as_str)
+        .context("pod is not scheduled to a node yet (no logs)")?;
+    let node = client
+        .get_raw(ResourceKind::Node, None, node_name)
+        .await?
+        .with_context(|| format!("node {node_name:?} not found"))?;
+    let address = node
+        .pointer("/status/address")
+        .and_then(Value::as_str)
+        .with_context(|| format!("node {node_name:?} has no address"))?;
+
+    // Minimal HTTP/1.0 GET to the node's log endpoint (port 10250).
+    let mut stream = tokio::net::TcpStream::connect((address, 10250u16))
+        .await
+        .with_context(|| format!("connecting to node {node_name} ({address}:10250)"))?;
+    let request =
+        format!("GET /logs/{ns}/{pod} HTTP/1.0\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+
+    // Split off the headers; print the body.
+    let text = String::from_utf8_lossy(&response);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    if text.starts_with("HTTP/1.0 404") || text.starts_with("HTTP/1.1 404") {
+        bail!("no logs available for {pod} (is it running?)");
+    }
+    use std::io::Write as _;
+    let _ = std::io::stdout().write_all(body.as_bytes());
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use anyhow::Context as _;
 use clap::Parser;
 use rk_agent::reconcile::{self, ActualContainer, DesiredPod, Op, Trackers};
-use rk_agent::{AgentConfig, cache, names, node, overlay, services};
+use rk_agent::{AgentConfig, cache, logs, names, node, overlay, probe, services};
 use rk_runtime::container::{self, PullPolicy, RunOptions};
 use rk_runtime::store::Store;
 use rk_types::client::{ApiClient, ClientError};
@@ -176,6 +176,9 @@ async fn run_agent() -> anyhow::Result<()> {
     ));
     tokio::spawn(services::run(client.clone(), dns_records));
 
+    // Serve this node's container logs to `rk-ctl logs`.
+    tokio::spawn(logs::serve(client.clone(), Arc::new(store.clone())));
+
     let pods: cache::SharedPods = Arc::default();
     let notify = Arc::new(Notify::new());
     tokio::spawn(cache::run(
@@ -187,6 +190,7 @@ async fn run_agent() -> anyhow::Result<()> {
 
     let mut trackers = Trackers::new();
     let mut problems: HashMap<String, String> = HashMap::new();
+    let mut probes: HashMap<String, probe::PodProbes> = HashMap::new();
     let resync = std::time::Duration::from_secs(config.resync_interval_secs.max(1));
     info!("reconcile loop running");
     loop {
@@ -200,6 +204,7 @@ async fn run_agent() -> anyhow::Result<()> {
             &pods,
             &mut trackers,
             &mut problems,
+            &mut probes,
             dns_server,
         )
         .await
@@ -216,6 +221,7 @@ async fn reconcile_once(
     pods: &cache::SharedPods,
     trackers: &mut Trackers,
     problems: &mut HashMap<String, String>,
+    probes: &mut HashMap<String, probe::PodProbes>,
     dns_server: Option<Ipv4Addr>,
 ) -> anyhow::Result<()> {
     let snapshot: Vec<Pod> = pods.lock().await.values().cloned().collect();
@@ -266,6 +272,15 @@ async fn reconcile_once(
         }
     }
 
+    // Run any due liveness/readiness probes; liveness failures restart the
+    // container (removed here, recreated next pass), readiness gates `ready`.
+    let observed = observe_actual(store)?;
+    let (readiness, to_restart) = run_probes(&desired, &observed, probes, now_epoch).await;
+    for runtime_name in to_restart {
+        warn!(container = %runtime_name, "liveness probe failed — restarting container");
+        remove_container(store, &runtime_name).await;
+    }
+
     // Report status from the post-execution view of the node.
     let actual = observe_actual(store)?;
     let by_name: HashMap<&str, &ActualContainer> = actual
@@ -296,6 +311,7 @@ async fn reconcile_once(
             actual_container,
             tracker,
             problems.get(&desired_pod.uid).map(String::as_str),
+            readiness.get(&desired_pod.uid).copied(),
         );
         if pod.status != status {
             let mut updated = pod.clone();
@@ -363,6 +379,73 @@ async fn prefetch_references(
 }
 
 /// The node's containers that belong to this agent (recognized by the
+/// Run due probes for every running pod, updating `probes` state in place.
+/// Returns each pod's readiness verdict (for pods with a readiness probe) and
+/// the runtime names of containers a liveness probe wants restarted.
+async fn run_probes(
+    desired: &[DesiredPod],
+    actual: &[ActualContainer],
+    probes: &mut HashMap<String, probe::PodProbes>,
+    now: u64,
+) -> (HashMap<String, bool>, Vec<String>) {
+    use probe::{ProbeKind, ProbeState};
+    let by_name: HashMap<&str, &ActualContainer> = actual
+        .iter()
+        .map(|c| (c.runtime_name.as_str(), c))
+        .collect();
+    let mut readiness = HashMap::new();
+    let mut restarts = Vec::new();
+
+    for pod in desired {
+        let Ok(run) = &pod.plan else { continue };
+        if run.liveness_probe.is_none() && run.readiness_probe.is_none() {
+            continue;
+        }
+        let Some(container) = by_name.get(run.runtime_name.as_str()) else {
+            continue;
+        };
+        if !matches!(container.status, rk_runtime::container::Status::Running) {
+            continue;
+        }
+        let Some(ip) = container.ip.as_deref().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        let pid1 = container.pid1.unwrap_or_default();
+        let age = container
+            .created_at
+            .map(|c| u64::try_from((chrono::Utc::now() - c).num_seconds()).unwrap_or(0))
+            .unwrap_or(0);
+        let entry = probes.entry(pod.uid.clone()).or_default();
+
+        if let Some(p) = &run.readiness_probe {
+            let state = entry
+                .readiness
+                .get_or_insert_with(|| ProbeState::new(ProbeKind::Readiness));
+            if probe::is_due(state, now, age, p) {
+                let ok = probe::execute(p, ip, pid1).await;
+                probe::record(state, ProbeKind::Readiness, ok, now, p);
+            }
+            readiness.insert(pod.uid.clone(), state.ready);
+        }
+        if let Some(p) = &run.liveness_probe {
+            let state = entry
+                .liveness
+                .get_or_insert_with(|| ProbeState::new(ProbeKind::Liveness));
+            if probe::is_due(state, now, age, p) {
+                let ok = probe::execute(p, ip, pid1).await;
+                if probe::record(state, ProbeKind::Liveness, ok, now, p).restart {
+                    restarts.push(run.runtime_name.clone());
+                }
+            }
+        }
+    }
+
+    // Drop state for pods no longer desired.
+    let live: std::collections::HashSet<&str> = desired.iter().map(|d| d.uid.as_str()).collect();
+    probes.retain(|uid, _| live.contains(uid.as_str()));
+    (readiness, restarts)
+}
+
 /// `p<uid12>-` naming scheme). Hand-started `rkrt` containers are invisible
 /// here and therefore never torn down as orphans.
 fn observe_actual(store: &Store) -> anyhow::Result<Vec<ActualContainer>> {
@@ -378,6 +461,7 @@ fn observe_actual(store: &Store) -> anyhow::Result<Vec<ActualContainer>> {
             image: row.image,
             status: row.status,
             ip: Some(row.ip),
+            pid1: row.pid1,
             created_at: chrono::DateTime::parse_from_rfc3339(&row.created_at)
                 .ok()
                 .map(|t| t.with_timezone(&chrono::Utc)),

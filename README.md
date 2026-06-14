@@ -19,7 +19,7 @@ for the full specification.
 - [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
-- [ ] Phase 7 — ingress + probes + logs + the website workload
+- [~] Phase 7 — **7A** probes + logs (done); **7B** ingress + the website workload (next)
 - [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
 
 ## Layout
@@ -156,6 +156,23 @@ curl http://whoami/                     # name → DNS → VIP → nftables → 
 both nodes) with a ClusterIP Service, resolves it by name from a client pod,
 and curls the VIP to show load-balancing across backends on both nodes via
 the overlay (design notes in [docs/phase-6b-notes.md](docs/phase-6b-notes.md)).
+
+## Probes + logs (Phase 7A scope)
+
+The agent runs liveness and readiness probes (`httpGet`, `tcpSocket`, `exec`).
+A readiness probe gates the pod's container `ready` status — and since
+services key endpoints on readiness, a not-ready pod receives no traffic; a
+liveness failure restarts the container. `rk-ctl logs <pod>` fetches a pod's
+output from the node running it.
+
+```sh
+rk-ctl get pods            # READY column reflects readiness probes (1/1, 0/1)
+rk-ctl logs web-0          # container stdout/stderr from the node
+```
+
+`scripts/phase7a-demo.sh` shows a probe-failing pod excluded from its
+service's endpoints, a liveness probe restarting a container, and `rk-ctl
+logs` (design notes in [docs/phase-7a-notes.md](docs/phase-7a-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

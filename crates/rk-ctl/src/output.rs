@@ -70,7 +70,7 @@ pub fn headers(kind: ResourceKind, with_namespace: bool) -> Vec<&'static str> {
     };
     headers.push("NAME");
     match kind {
-        ResourceKind::Pod => headers.extend(["STATUS", "RESTARTS", "IP", "NODE"]),
+        ResourceKind::Pod => headers.extend(["READY", "STATUS", "RESTARTS", "IP", "NODE"]),
         ResourceKind::Node => headers.push("STATUS"),
         ResourceKind::Deployment => headers.extend(["READY", "UP-TO-DATE", "AVAILABLE"]),
         ResourceKind::ReplicaSet => headers.extend(["DESIRED", "CURRENT", "READY"]),
@@ -171,6 +171,20 @@ pub fn row(
     );
     match kind {
         ResourceKind::Pod => {
+            // READY = ready containers / total (readiness probes gate this).
+            let statuses = object
+                .pointer("/status/containerStatuses")
+                .and_then(Value::as_array);
+            let total = object
+                .pointer("/spec/containers")
+                .and_then(Value::as_array)
+                .map_or(1, Vec::len);
+            let ready = statuses.map_or(0, |s| {
+                s.iter()
+                    .filter(|c| c.get("ready").and_then(Value::as_bool) == Some(true))
+                    .count()
+            });
+            row.push(format!("{ready}/{total}"));
             // A statusless pod reads Pending, matching what Kubernetes shows
             // before a kubelet picks the pod up.
             row.push(pod_display_status(object));
@@ -273,15 +287,17 @@ mod tests {
             "status": {
                 "phase": "Running",
                 "podIP": "10.42.0.6",
-                "containerStatuses": [{ "name": "nginx", "restartCount": 2,
+                "containerStatuses": [{ "name": "nginx", "restartCount": 2, "ready": true,
                                         "state": { "running": {} } }]
-            }
+            },
+            "spec": { "nodeName": "worker-1", "containers": [{ "name": "nginx", "image": "nginx" }] }
         });
         assert_eq!(
             row(ResourceKind::Pod, &pod, true, now),
             vec![
                 "prod",
                 "web-0",
+                "1/1",
                 "Running",
                 "2",
                 "10.42.0.6",
@@ -293,8 +309,30 @@ mod tests {
         let bare = serde_json::json!({ "metadata": { "name": "new-pod" } });
         assert_eq!(
             row(ResourceKind::Pod, &bare, false, now),
-            vec!["new-pod", "Pending", "0", "<none>", "<none>", "<unknown>"]
+            vec![
+                "new-pod",
+                "0/1",
+                "Pending",
+                "0",
+                "<none>",
+                "<none>",
+                "<unknown>"
+            ]
         );
+    }
+
+    #[test]
+    fn not_ready_pods_show_a_zero_ready_fraction() {
+        let pod = serde_json::json!({
+            "metadata": { "name": "web-0" },
+            "spec": { "containers": [{ "name": "nginx", "image": "nginx" }] },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{ "name": "nginx", "ready": false, "state": { "running": {} } }]
+            }
+        });
+        // Running but its readiness probe hasn't passed: 0/1 ready.
+        assert_eq!(row(ResourceKind::Pod, &pod, false, Utc::now())[1], "0/1");
     }
 
     #[test]
@@ -308,8 +346,8 @@ mod tests {
             }
         });
         let row = row(ResourceKind::Pod, &pod, false, Utc::now());
-        assert_eq!(row[1], "CrashLoopBackOff");
-        assert_eq!(row[2], "4");
+        assert_eq!(row[2], "CrashLoopBackOff");
+        assert_eq!(row[3], "4");
     }
 
     #[test]
@@ -326,7 +364,7 @@ mod tests {
 
     #[test]
     fn headers_match_row_shapes() {
-        assert_eq!(headers(ResourceKind::Pod, true).len(), 7);
+        assert_eq!(headers(ResourceKind::Pod, true).len(), 8);
         assert_eq!(
             headers(ResourceKind::Node, false),
             vec!["NAME", "STATUS", "AGE"]

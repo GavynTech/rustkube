@@ -10,9 +10,11 @@
 
 pub mod cache;
 pub mod config;
+pub mod logs;
 pub mod names;
 pub mod node;
 pub mod overlay;
+pub mod probe;
 pub mod reconcile;
 pub mod services;
 

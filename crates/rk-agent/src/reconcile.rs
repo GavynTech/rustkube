@@ -46,6 +46,8 @@ pub struct ContainerToRun {
     pub env: Vec<String>,
     pub command: Option<Vec<String>>,
     pub args: Option<Vec<String>>,
+    pub liveness_probe: Option<rk_types::pod::Probe>,
+    pub readiness_probe: Option<rk_types::pod::Probe>,
 }
 
 /// One container as the runtime reports it.
@@ -56,6 +58,7 @@ pub struct ActualContainer {
     pub image: String,
     pub status: RuntimeStatus,
     pub ip: Option<String>,
+    pub pid1: Option<i32>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -210,6 +213,7 @@ pub fn pod_status(
     actual: Option<&ActualContainer>,
     tracker: Option<&Tracker>,
     problem: Option<&str>,
+    readiness: Option<bool>,
 ) -> PodStatus {
     let mut message_parts: Vec<String> = pod.notes.clone();
     let restart_count = tracker.map_or(0, |t| t.restarts.saturating_sub(1));
@@ -251,8 +255,9 @@ pub fn pod_status(
                 }),
                 ..ContainerState::default()
             },
-            // Ready tracks "running" until probes arrive in Phase 7.
-            true,
+            // A readiness probe's verdict gates readiness; without one, a
+            // running container is ready.
+            readiness.unwrap_or(true),
         ),
         Some((status @ (RuntimeStatus::Exited(_) | RuntimeStatus::Unknown), actual)) => {
             let exit_code = match status {
@@ -318,7 +323,7 @@ pub fn desire(
     let uid12 = names::uid12(&uid);
     let namespace = pod.metadata.namespace_or_default().to_owned();
     let name = pod.metadata.name.clone();
-    let mut notes = Vec::new();
+    let notes = Vec::new();
 
     let plan = (|| -> Result<ContainerToRun, String> {
         let [container] = pod.spec.containers.as_slice() else {
@@ -335,10 +340,7 @@ pub fn desire(
             ));
         }
         if !pod.spec.volumes.is_empty() || !container.volume_mounts.is_empty() {
-            return Err("unsupported: volumes arrive in Phase 7".to_owned());
-        }
-        if container.liveness_probe.is_some() || container.readiness_probe.is_some() {
-            notes.push("probes are not evaluated until Phase 7".to_owned());
+            return Err("unsupported: volumes arrive later".to_owned());
         }
 
         Ok(ContainerToRun {
@@ -352,6 +354,8 @@ pub fn desire(
             env: resolve_env(&container.env, config_maps, secrets)?,
             command: container.command.clone(),
             args: container.args.clone(),
+            liveness_probe: container.liveness_probe.clone(),
+            readiness_probe: container.readiness_probe.clone(),
         })
     })();
 
@@ -461,6 +465,7 @@ mod tests {
             image: image.to_owned(),
             status: RuntimeStatus::Running,
             ip: Some("10.42.0.6".to_owned()),
+            pid1: Some(1234),
             created_at: Some(chrono::Utc::now()),
         }
     }
@@ -627,7 +632,7 @@ mod tests {
         let pod = desired(UID, "nginx");
 
         // Not started yet.
-        let status = pod_status(&pod, None, None, None);
+        let status = pod_status(&pod, None, None, None, None);
         assert_eq!(status.phase, PodPhase::Pending);
         assert_eq!(
             status.container_statuses[0]
@@ -640,7 +645,13 @@ mod tests {
         );
 
         // Pull failure surfaces as the waiting reason.
-        let status = pod_status(&pod, None, None, Some("ErrImagePull: manifest unknown"));
+        let status = pod_status(
+            &pod,
+            None,
+            None,
+            Some("ErrImagePull: manifest unknown"),
+            None,
+        );
         assert!(
             status
                 .message
@@ -651,10 +662,18 @@ mod tests {
 
         // Running.
         let actual = running(RT_NAME, "4f9d2c81aa55", "nginx");
-        let status = pod_status(&pod, Some(&actual), None, None);
+        let status = pod_status(&pod, Some(&actual), None, None, None);
         assert_eq!(status.phase, PodPhase::Running);
         assert_eq!(status.pod_ip.unwrap().to_string(), "10.42.0.6");
         assert!(status.container_statuses[0].ready);
+
+        // A readiness probe that hasn't passed keeps a running pod not-ready.
+        let status = pod_status(&pod, Some(&actual), None, None, Some(false));
+        assert_eq!(status.phase, PodPhase::Running);
+        assert!(
+            !status.container_statuses[0].ready,
+            "readiness gate applies"
+        );
 
         // Crash-looping: phase stays Running, state says CrashLoopBackOff.
         let mut crashed = actual.clone();
@@ -663,7 +682,7 @@ mod tests {
             restarts: 3,
             ..Tracker::default()
         };
-        let status = pod_status(&pod, Some(&crashed), Some(&tracker), None);
+        let status = pod_status(&pod, Some(&crashed), Some(&tracker), None, None);
         assert_eq!(status.phase, PodPhase::Running);
         assert_eq!(status.container_statuses[0].restart_count, 2);
         assert_eq!(
@@ -681,14 +700,14 @@ mod tests {
         once.restart_policy = RestartPolicy::Never;
         let mut done = actual.clone();
         done.status = RuntimeStatus::Exited(0);
-        let status = pod_status(&once, Some(&done), None, None);
+        let status = pod_status(&once, Some(&done), None, None, None);
         assert_eq!(status.phase, PodPhase::Succeeded);
 
         // Invalid pods are Failed with the reason.
         let mut multi = simple_pod(UID, "nginx");
         multi.spec.containers.push(multi.spec.containers[0].clone());
         let invalid = desire(&multi, &BTreeMap::new(), &BTreeMap::new()).unwrap();
-        let status = pod_status(&invalid, None, None, None);
+        let status = pod_status(&invalid, None, None, None, None);
         assert_eq!(status.phase, PodPhase::Failed);
         assert!(status.message.unwrap().contains("Phase 6"));
     }
