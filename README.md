@@ -18,7 +18,7 @@ for the full specification.
 - [x] Phase 3 — node agent (reconcile assigned pods, report status)
 - [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
-- [ ] Phase 6 — networking (bridge/veth, VXLAN, service VIPs, DNS)
+- [~] Phase 6 — networking: **6A** bridge/veth + VXLAN overlay (done); **6B** service VIPs + DNS (next)
 - [ ] Phase 7 — ingress + probes + logs + the website workload
 - [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
 
@@ -32,7 +32,7 @@ for the full specification.
 | `crates/rk-scheduler` | bin | pod → node placement (filter + most-allocated bin packing, nodeSelector) |
 | `crates/rk-controllers` | bin | Deployment/ReplicaSet/Node controllers + owner-ref GC |
 | `crates/rk-runtime` | lib | OCI image + container lifecycle |
-| `crates/rk-net` | lib | bridge/veth/VXLAN, IPAM, service VIPs, DNS |
+| `crates/rk-net` | lib | VXLAN overlay (route/neighbour/FDB per node); service VIPs + DNS in 6B |
 | `crates/rk-agent` | bin | per-node kubelet equivalent |
 | `crates/rk-ctl` | bin | CLI |
 
@@ -122,6 +122,20 @@ rk-ctl delete deployment web               # GC removes its ReplicaSets, then Po
 `scripts/phase5-demo.sh` runs the lot on the two-node VM cluster: deploy,
 self-heal, scale up/down, a rolling update, node-death rescheduling, and
 cascade delete (design notes in [docs/phase-5-notes.md](docs/phase-5-notes.md)).
+
+## Pod networking (Phase 6A scope)
+
+Each node runs a Linux bridge (`rk-br0`) that its pods' veths land on, so
+same-node pods share an L2 segment. Cross-node traffic rides a VXLAN overlay
+(`rk-vxlan0`): every agent advertises its tunnel endpoint (VTEP MAC) on its
+Node and programs route/neighbour/FDB entries for each peer from the Node
+list — flannel's unicast model, no flooding.
+
+`scripts/phase6a-demo.sh` pins an nginx pod to each of the two nodes and
+shows a pod on node1 curling a pod on node2 over the tunnel (both ways), plus
+same-node connectivity over the bridge (design notes in
+[docs/phase-6a-notes.md](docs/phase-6a-notes.md)). Services with virtual IPs
+and the embedded DNS server arrive in Phase 6B.
 
 ## Container runner (Phase 1 scope)
 

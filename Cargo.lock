@@ -1980,8 +1980,12 @@ dependencies = [
 name = "rk-net"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "ipnetwork",
+ "rtnetlink",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

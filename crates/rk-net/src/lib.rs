@@ -1,10 +1,14 @@
 //! Container networking for RustKube.
 //!
-//! Phase 6 adds: per-node Linux bridge + veth pair per pod, cluster-wide IPAM
-//! (a /24 per node carved from the pod CIDR below), VXLAN overlay between
-//! nodes (rtnetlink), nftables DNAT rules for service virtual IPs, and the
-//! embedded DNS server. Phase 0 establishes the crate and the pod-CIDR
-//! contract every later piece builds on.
+//! The per-pod bridge + veth wiring lives in `rk-runtime` (it runs alongside
+//! the container shim); this crate owns the node-level overlay: the VXLAN
+//! device and the route/neighbour/FDB entries that carry pod traffic between
+//! nodes ([`overlay`]). Services (nftables VIPs) and the embedded DNS server
+//! land here in Phase 6B.
+
+pub mod overlay;
+
+use std::net::Ipv4Addr;
 
 use ipnetwork::Ipv4Network;
 
@@ -16,6 +20,16 @@ pub const DEFAULT_POD_CIDR: &str = "10.42.0.0/16";
 pub enum NetError {
     #[error("invalid pod CIDR {cidr:?}: {reason}")]
     InvalidPodCidr { cidr: String, reason: String },
+
+    #[error("netlink {op} failed: {detail}")]
+    Netlink { op: &'static str, detail: String },
+}
+
+/// A node's VTEP overlay IP is the network address of its pod /24
+/// (`10.42.1.0/24` → `10.42.1.0`). Deterministic, so peers derive it from the
+/// node's advertised pod CIDR without extra coordination.
+pub fn vtep_ip(pod_cidr: Ipv4Network) -> Ipv4Addr {
+    pod_cidr.network()
 }
 
 /// Validate a cluster pod CIDR: IPv4 and wide enough to carve at least one

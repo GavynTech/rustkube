@@ -10,3 +10,7 @@ workspace = true
 [dependencies]
 ipnetwork.workspace = true
 thiserror.workspace = true
+rtnetlink.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+tracing.workspace = true

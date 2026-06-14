@@ -12,6 +12,7 @@ pub mod cache;
 pub mod config;
 pub mod names;
 pub mod node;
+pub mod overlay;
 pub mod reconcile;
 
 pub use config::AgentConfig;

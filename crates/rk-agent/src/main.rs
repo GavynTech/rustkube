@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
 use rk_agent::reconcile::{self, ActualContainer, DesiredPod, Op, Trackers};
-use rk_agent::{AgentConfig, cache, names, node};
+use rk_agent::{AgentConfig, cache, names, node, overlay};
 use rk_runtime::container::{self, PullPolicy, RunOptions};
 use rk_runtime::store::Store;
 use rk_types::client::{ApiClient, ClientError};
@@ -98,12 +99,36 @@ async fn run_agent() -> anyhow::Result<()> {
             .with_context(|| format!("configuring pod CIDR {cidr}"))?;
     }
 
+    // Bring up this node's VXLAN endpoint and learn its MAC to advertise. The
+    // overlay needs the node's pod CIDR and an underlay address; without both
+    // we run single-node (same-node pod networking still works via the bridge).
+    let vtep = match (&config.pod_cidr, address) {
+        (Some(cidr), Some(IpAddr::V4(underlay))) => {
+            let network = rk_net::parse_pod_cidr(cidr)?;
+            match rk_net::overlay::ensure_vxlan(underlay, rk_net::vtep_ip(network)).await {
+                Ok(vtep) => {
+                    info!(mac = %vtep.mac, vtep_ip = %vtep.vxlan_ip, "VXLAN overlay endpoint up");
+                    Some(vtep)
+                }
+                Err(err) => {
+                    warn!(error = %err, "VXLAN setup failed; cross-node pod traffic disabled");
+                    None
+                }
+            }
+        }
+        _ => {
+            info!("no pod CIDR or IPv4 address; running without the VXLAN overlay");
+            None
+        }
+    };
+
     let registration = node::Registration {
         name: node_name.clone(),
         address,
         capacity,
         labels: config.node_labels.clone(),
         pod_cidr: config.pod_cidr.clone(),
+        vtep_mac: vtep.as_ref().map(|v| v.mac.clone()),
     };
 
     // The API server may still be coming up; registration retries until it
@@ -123,6 +148,15 @@ async fn run_agent() -> anyhow::Result<()> {
         registration,
         config.heartbeat_interval_secs,
     ));
+
+    // Keep the overlay's peer routes in sync with the Node list.
+    if let Some(vtep) = vtep {
+        tokio::spawn(overlay::run(
+            client.clone(),
+            node_name.clone(),
+            vtep.vxlan_ip,
+        ));
+    }
 
     let pods: cache::SharedPods = Arc::default();
     let notify = Arc::new(Notify::new());

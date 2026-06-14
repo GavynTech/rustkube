@@ -1,13 +1,14 @@
-//! Phase 1 networking: one veth pair per container, host end in the host
-//! namespace, peer renamed `eth0` inside the container's netns.
+//! Pod networking: a node-local Linux bridge (`rk-br0`) plus one veth pair
+//! per pod. The host end is enslaved to the bridge; the peer becomes `eth0`
+//! in the pod's netns with a /24 address and a default route via the bridge
+//! gateway (`.1`). Pods on the same node share the bridge's L2 segment and
+//! reach each other directly (Phase 6 — Phase 1's /30-per-pod could not).
 //!
-//! Each container gets a /30 carved from this data dir's pod /24 (host = .1
-//! of the block, container = .2), so the node curls the container IP over the
-//! connected route on the veth — no bridge, no NAT, no DNS yet. The /24 base
-//! defaults to `10.42.0.0/24` (Phase 1 `rkrt`) and is set per node by the
-//! agent ([`configure_pod_cidr`]) from Phase 4, so simulated nodes don't
-//! collide. The real cross-node pod network (bridge + VXLAN + service VIPs)
-//! replaces this in Phase 6; outbound container traffic is out of scope here.
+//! IPAM hands out /32 pod IPs (`.2` .. `.254`) from this data dir's /24; the
+//! base defaults to `10.42.0.0/24` and is set per node by the agent
+//! ([`configure_pod_cidr`]), so simulated nodes don't collide. Reaching pods
+//! on *other* nodes' /24s is the VXLAN overlay the agent programs (`rk-net`);
+//! this module owns only the node-local bridge and the pod veths.
 //!
 //! Configuring the inside of the netns uses the standard setns trick: a
 //! scratch thread joins the container's network namespace (threads carry
@@ -25,29 +26,39 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, RuntimeError};
 use crate::store::Store;
 
-/// Default /24 the /30 blocks are carved from when no pod CIDR is configured.
+/// Default /24 pods are carved from when no pod CIDR is configured.
 const POD_NET_BASE: Ipv4Addr = Ipv4Addr::new(10, 42, 0, 0);
-/// 64 /30 blocks fit in the /24; block 0 is kept aside so .0/.1 never collide
-/// with anything that assumes a network address.
-const MAX_BLOCKS: u32 = 63;
+/// The node-local bridge every pod's veth lands on; its address is the pods'
+/// gateway. Same-node pods share its L2 segment; off-node /24s route out the
+/// VXLAN device the agent programs (see `rk-net`).
+const BRIDGE_NAME: &str = "rk-br0";
+const POD_PREFIX: u8 = 24;
+/// `.1` is the bridge/gateway; pods take `.2` .. `.254`.
+const GATEWAY_OCTET: u32 = 1;
+const MAX_POD_OCTET: u32 = 254;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PodNet {
+    /// Host octet of the pod IP (2..=254) — the IPAM allocation unit.
     pub block: u32,
+    /// The node bridge gateway (`.1`), the pod's default route.
     pub host_ip: Ipv4Addr,
     pub container_ip: Ipv4Addr,
 }
 
-/// `(host, container)` addresses of a /30 block within `base`: net + 1 and + 2.
-fn block_ips(base: Ipv4Addr, block: u32) -> (Ipv4Addr, Ipv4Addr) {
-    let net = u32::from(base) + block * 4;
-    (Ipv4Addr::from(net + 1), Ipv4Addr::from(net + 2))
+/// `(gateway, pod)` addresses for a host octet within the node's /24.
+fn addrs(base: Ipv4Addr, octet: u32) -> (Ipv4Addr, Ipv4Addr) {
+    let net = u32::from(base);
+    (
+        Ipv4Addr::from(net + GATEWAY_OCTET),
+        Ipv4Addr::from(net + octet),
+    )
 }
 
-fn pod_net(base: Ipv4Addr, block: u32) -> PodNet {
-    let (host_ip, container_ip) = block_ips(base, block);
+fn pod_net(base: Ipv4Addr, octet: u32) -> PodNet {
+    let (host_ip, container_ip) = addrs(base, octet);
     PodNet {
-        block,
+        block: octet,
         host_ip,
         container_ip,
     }
@@ -127,24 +138,25 @@ fn parse_slash24(cidr: &str) -> Result<Ipv4Addr> {
     Ok(Ipv4Addr::from(u32::from(addr) & 0xFFFF_FF00))
 }
 
-/// Hand out the lowest free /30 block from this data dir's /24. Freed blocks
-/// are reused before new ones are cut. Single-writer by construction (one
-/// agent owns one data dir).
+/// Hand out the lowest free pod IP (host octet) from this data dir's /24.
+/// Freed octets are reused before new ones are cut. Single-writer by
+/// construction (one agent owns one data dir).
 pub fn allocate(store: &Store) -> Result<PodNet> {
     let mut state = read_ipam(store)?;
     let base = base_of(&state);
-    let block = if let Some(block) = state.free.pop() {
-        block
+    let octet = if let Some(octet) = state.free.pop() {
+        octet
     } else {
-        // Block numbering starts at 1; see MAX_BLOCKS.
-        if state.next + 1 > MAX_BLOCKS {
-            return Err(RuntimeError::PoolExhausted(MAX_BLOCKS));
+        // `next` tracks the highest octet handed out; first pod is `.2`.
+        let next = state.next.max(GATEWAY_OCTET) + 1;
+        if next > MAX_POD_OCTET {
+            return Err(RuntimeError::PoolExhausted(MAX_POD_OCTET - GATEWAY_OCTET));
         }
-        state.next += 1;
-        state.next
+        state.next = next;
+        next
     };
     write_ipam(store, &state)?;
-    Ok(pod_net(base, block))
+    Ok(pod_net(base, octet))
 }
 
 pub fn release(store: &Store, block: u32) -> Result<()> {
@@ -176,6 +188,66 @@ async fn link_index(handle: &rtnetlink::Handle, name: &str) -> Result<u32> {
     Ok(link.header.index)
 }
 
+/// Index of a link if it exists; `None` if it doesn't (a missing link makes
+/// the kernel error the query, which we read as absence).
+async fn link_index_opt(handle: &rtnetlink::Handle, name: &str) -> Option<u32> {
+    handle
+        .link()
+        .get()
+        .match_name(name.to_owned())
+        .execute()
+        .try_next()
+        .await
+        .ok()
+        .flatten()
+        .map(|link| link.header.index)
+}
+
+/// Best-effort enable of IPv4 forwarding so the node routes between the pod
+/// bridge and the VXLAN overlay. Per-netns on Linux, so each simulated node
+/// sets its own.
+fn enable_ip_forwarding() {
+    let path = "/proc/sys/net/ipv4/ip_forward";
+    if let Err(err) = std::fs::write(path, "1") {
+        tracing::warn!(error = %err, "could not enable ip_forward; cross-node traffic may not route");
+    }
+}
+
+/// Ensure the node bridge exists, is addressed with the gateway and is up.
+/// Idempotent: the first pod on a node creates it, the rest find it.
+async fn ensure_bridge(handle: &rtnetlink::Handle, gateway: Ipv4Addr) -> Result<u32> {
+    if let Some(index) = link_index_opt(handle, BRIDGE_NAME).await {
+        handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+            .execute()
+            .await
+            .map_err(|err| RuntimeError::net("raising bridge", err.to_string()))?;
+        return Ok(index);
+    }
+    // Create + address. EEXIST from a concurrent create is harmless; the
+    // lookup right after confirms the bridge is really there.
+    let _ = handle
+        .link()
+        .add(rtnetlink::LinkBridge::new(BRIDGE_NAME).build())
+        .execute()
+        .await;
+    let index = link_index(handle, BRIDGE_NAME).await?;
+    let _ = handle
+        .address()
+        .add(index, gateway.into(), POD_PREFIX)
+        .execute()
+        .await;
+    handle
+        .link()
+        .set(rtnetlink::LinkUnspec::new_with_index(index).up().build())
+        .execute()
+        .await
+        .map_err(|err| RuntimeError::net("raising bridge", err.to_string()))?;
+    enable_ip_forwarding();
+    Ok(index)
+}
+
 /// Host-side half: create the veth pair, push the peer into the shim's netns,
 /// then address and raise the host end.
 async fn setup_host_side(
@@ -187,6 +259,8 @@ async fn setup_host_side(
     let (connection, handle, _) = rtnetlink::new_connection()
         .map_err(|err| RuntimeError::net("opening netlink", err.to_string()))?;
     tokio::spawn(connection);
+
+    let bridge = ensure_bridge(&handle, net.host_ip).await?;
 
     handle
         .link()
@@ -210,19 +284,20 @@ async fn setup_host_side(
             .await
             .map_err(|err| RuntimeError::net("moving peer into netns", err.to_string()))?;
 
+        // Host end has no IP of its own — it's a bridge port. Enslave it to
+        // the node bridge and bring it up; the gateway lives on the bridge.
         let host = link_index(&handle, host_name).await?;
         handle
-            .address()
-            .add(host, net.host_ip.into(), 30)
-            .execute()
-            .await
-            .map_err(|err| RuntimeError::net("addressing host veth", err.to_string()))?;
-        handle
             .link()
-            .set(rtnetlink::LinkUnspec::new_with_index(host).up().build())
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(host)
+                    .controller(bridge)
+                    .up()
+                    .build(),
+            )
             .execute()
             .await
-            .map_err(|err| RuntimeError::net("raising host veth", err.to_string()))?;
+            .map_err(|err| RuntimeError::net("enslaving host veth to bridge", err.to_string()))?;
         Ok(())
     }
     .await;
@@ -271,7 +346,7 @@ async fn setup_container_side(net: PodNet, peer_name: &str) -> Result<()> {
         .map_err(|err| RuntimeError::net("renaming peer to eth0", err.to_string()))?;
     handle
         .address()
-        .add(eth, net.container_ip.into(), 30)
+        .add(eth, net.container_ip.into(), POD_PREFIX)
         .execute()
         .await
         .map_err(|err| RuntimeError::net("addressing eth0", err.to_string()))?;
@@ -341,25 +416,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blocks_map_to_host_and_container_ips() {
-        let cases = [
-            (1, "10.42.0.5", "10.42.0.6"),
-            (2, "10.42.0.9", "10.42.0.10"),
-            (62, "10.42.0.249", "10.42.0.250"),
-        ];
-        for (block, host, container) in cases {
-            let net = pod_net(POD_NET_BASE, block);
-            assert_eq!(net.host_ip.to_string(), host, "block {block}");
-            assert_eq!(net.container_ip.to_string(), container, "block {block}");
+    fn octets_map_to_gateway_and_pod_ips() {
+        // The gateway is always `.1`; the pod takes its octet.
+        let cases = [(2, "10.42.0.2"), (3, "10.42.0.3"), (254, "10.42.0.254")];
+        for (octet, pod) in cases {
+            let net = pod_net(POD_NET_BASE, octet);
+            assert_eq!(net.host_ip.to_string(), "10.42.0.1", "octet {octet}");
+            assert_eq!(net.container_ip.to_string(), pod, "octet {octet}");
         }
     }
 
     #[test]
     fn pod_cidr_shifts_the_whole_24() {
         let base = parse_slash24("10.42.7.0/24").unwrap();
-        let net = pod_net(base, 1);
-        assert_eq!(net.host_ip.to_string(), "10.42.7.5");
-        assert_eq!(net.container_ip.to_string(), "10.42.7.6");
+        let net = pod_net(base, 2);
+        assert_eq!(net.host_ip.to_string(), "10.42.7.1");
+        assert_eq!(net.container_ip.to_string(), "10.42.7.2");
     }
 
     #[test]
@@ -391,29 +463,30 @@ mod tests {
 
         configure_pod_cidr(&store, "10.42.5.0/24").unwrap();
         let net = allocate(&store).unwrap();
-        assert_eq!(net.container_ip.to_string(), "10.42.5.6");
+        assert_eq!(net.container_ip.to_string(), "10.42.5.2", "first pod is .2");
+        assert_eq!(net.host_ip.to_string(), "10.42.5.1", "gateway is .1");
 
-        // Re-pinning the same CIDR is fine; a different one with live blocks is not.
+        // Re-pinning the same CIDR is fine; a different one with live pods is not.
         configure_pod_cidr(&store, "10.42.5.0/24").unwrap();
         assert!(configure_pod_cidr(&store, "10.42.9.0/24").is_err());
     }
 
     #[test]
-    fn allocate_reuses_released_blocks_first() {
+    fn allocate_reuses_released_octets_first() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::new(dir.path());
         store.ensure_layout().unwrap();
 
         let first = allocate(&store).unwrap();
         let second = allocate(&store).unwrap();
-        assert_eq!(first.block, 1);
-        assert_eq!(second.block, 2);
+        assert_eq!(first.block, 2, "pods start at .2 (.1 is the gateway)");
+        assert_eq!(second.block, 3);
 
         release(&store, first.block).unwrap();
         let third = allocate(&store).unwrap();
-        assert_eq!(third.block, first.block, "freed block is reused");
+        assert_eq!(third.block, first.block, "freed octet is reused");
         let fourth = allocate(&store).unwrap();
-        assert_eq!(fourth.block, 3);
+        assert_eq!(fourth.block, 4);
     }
 
     #[test]
@@ -426,7 +499,7 @@ mod tests {
         release(&store, net.block).unwrap();
         release(&store, net.block).unwrap();
         assert_eq!(allocate(&store).unwrap().block, net.block);
-        assert_eq!(allocate(&store).unwrap().block, 2);
+        assert_eq!(allocate(&store).unwrap().block, 3);
     }
 
     #[test]

@@ -64,6 +64,8 @@ pub struct Registration {
     pub capacity: ResourceList,
     pub labels: BTreeMap<String, String>,
     pub pod_cidr: Option<String>,
+    /// This node's VXLAN VTEP MAC, advertised so peers can reach its pods.
+    pub vtep_mac: Option<String>,
 }
 
 fn ready_status(node: &mut Node, reg: &Registration) {
@@ -83,6 +85,11 @@ fn apply_identity(node: &mut Node, reg: &Registration) {
         .insert("rustkube.io/hostname".to_owned(), reg.name.clone());
     if let Some(cidr) = &reg.pod_cidr {
         node.spec.pod_cidr = Some(cidr.clone());
+    }
+    if let Some(mac) = &reg.vtep_mac {
+        node.metadata
+            .annotations
+            .insert(crate::overlay::VTEP_MAC_ANNOTATION.to_owned(), mac.clone());
     }
 }
 
