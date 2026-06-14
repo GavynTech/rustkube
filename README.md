@@ -18,7 +18,7 @@ for the full specification.
 - [x] Phase 3 — node agent (reconcile assigned pods, report status)
 - [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
-- [~] Phase 6 — networking: **6A** bridge/veth + VXLAN overlay (done); **6B** service VIPs + DNS (next)
+- [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
 - [ ] Phase 7 — ingress + probes + logs + the website workload
 - [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
 
@@ -32,7 +32,7 @@ for the full specification.
 | `crates/rk-scheduler` | bin | pod → node placement (filter + most-allocated bin packing, nodeSelector) |
 | `crates/rk-controllers` | bin | Deployment/ReplicaSet/Node controllers + owner-ref GC |
 | `crates/rk-runtime` | lib | OCI image + container lifecycle |
-| `crates/rk-net` | lib | VXLAN overlay (route/neighbour/FDB per node); service VIPs + DNS in 6B |
+| `crates/rk-net` | lib | VXLAN overlay, nftables service VIPs, embedded DNS server |
 | `crates/rk-agent` | bin | per-node kubelet equivalent |
 | `crates/rk-ctl` | bin | CLI |
 
@@ -134,8 +134,28 @@ list — flannel's unicast model, no flooding.
 `scripts/phase6a-demo.sh` pins an nginx pod to each of the two nodes and
 shows a pod on node1 curling a pod on node2 over the tunnel (both ways), plus
 same-node connectivity over the bridge (design notes in
-[docs/phase-6a-notes.md](docs/phase-6a-notes.md)). Services with virtual IPs
-and the embedded DNS server arrive in Phase 6B.
+[docs/phase-6a-notes.md](docs/phase-6a-notes.md)).
+
+## Services + DNS (Phase 6B scope)
+
+A Service gets a stable ClusterIP (allocated from 10.96.0.0/16 at admission);
+every node's agent watches Services and Pods, computes the ready endpoints,
+and programs an nftables table that DNATs the VIP to a backing pod
+(load-balanced with `numgen random`). Each agent also runs a small embedded
+DNS server on its bridge gateway — which the runtime writes into every pod's
+`/etc/resolv.conf` — resolving `service.namespace` to its ClusterIP.
+
+```sh
+rk-ctl apply -f app-and-service.yaml   # a Deployment + a ClusterIP Service
+rk-ctl get services                    # whoami  ClusterIP  10.96.0.10  80/TCP
+# from inside any pod:
+curl http://whoami/                     # name → DNS → VIP → nftables → a backend
+```
+
+`scripts/phase6b-demo.sh` fronts a Deployment of `whoami` pods (spread across
+both nodes) with a ClusterIP Service, resolves it by name from a client pod,
+and curls the VIP to show load-balancing across backends on both nodes via
+the overlay (design notes in [docs/phase-6b-notes.md](docs/phase-6b-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

@@ -14,5 +14,6 @@ pub mod names;
 pub mod node;
 pub mod overlay;
 pub mod reconcile;
+pub mod services;
 
 pub use config::AgentConfig;

@@ -39,6 +39,10 @@ pub struct RunOptions {
     /// Overrides the image CMD (Kubernetes `args`).
     pub args: Option<Vec<String>>,
     pub pull: PullPolicy,
+    /// Cluster DNS server for the pod's `/etc/resolv.conf` (the node gateway).
+    pub dns_server: Option<std::net::Ipv4Addr>,
+    /// The pod's namespace, for the resolv.conf search list.
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug)]
@@ -234,6 +238,10 @@ async fn start_networked(
 ) -> Result<RunSummary> {
     let container_dir = container_dir.to_path_buf();
     rootfs::write_etc_hosts(&rootfs_path, &opts.name, &pod_net.container_ip.to_string())?;
+    if let Some(dns) = opts.dns_server {
+        let namespace = opts.namespace.as_deref().unwrap_or("default");
+        rootfs::write_resolv_conf(&rootfs_path, &dns.to_string(), namespace)?;
+    }
 
     let runtime_spec = RuntimeSpec {
         name: opts.name.clone(),

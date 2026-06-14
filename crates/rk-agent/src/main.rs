@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Context as _;
 use clap::Parser;
 use rk_agent::reconcile::{self, ActualContainer, DesiredPod, Op, Trackers};
-use rk_agent::{AgentConfig, cache, names, node, overlay};
+use rk_agent::{AgentConfig, cache, names, node, overlay, services};
 use rk_runtime::container::{self, PullPolicy, RunOptions};
 use rk_runtime::store::Store;
 use rk_types::client::{ApiClient, ClientError};
@@ -99,6 +100,14 @@ async fn run_agent() -> anyhow::Result<()> {
             .with_context(|| format!("configuring pod CIDR {cidr}"))?;
     }
 
+    // The node bridge must exist before the DNS server binds its gateway IP,
+    // so create it now rather than lazily on the first pod. The gateway is
+    // both the pods' default route and the cluster DNS server they query.
+    let gateway = rk_runtime::net::ensure_node_bridge(&store)
+        .await
+        .context("creating the node bridge")?;
+    let dns_server = Some(gateway);
+
     // Bring up this node's VXLAN endpoint and learn its MAC to advertise. The
     // overlay needs the node's pod CIDR and an underlay address; without both
     // we run single-node (same-node pod networking still works via the bridge).
@@ -158,6 +167,15 @@ async fn run_agent() -> anyhow::Result<()> {
         ));
     }
 
+    // The service data plane: nftables VIP rules + the embedded DNS server,
+    // both fed from the cluster's Services and Pods.
+    let dns_records: rk_net::dns::Records = Arc::new(Mutex::new(HashMap::new()));
+    tokio::spawn(rk_net::dns::serve(
+        std::net::SocketAddr::from((gateway, 53)),
+        dns_records.clone(),
+    ));
+    tokio::spawn(services::run(client.clone(), dns_records));
+
     let pods: cache::SharedPods = Arc::default();
     let notify = Arc::new(Notify::new());
     tokio::spawn(cache::run(
@@ -176,7 +194,15 @@ async fn run_agent() -> anyhow::Result<()> {
             _ = notify.notified() => {}
             _ = tokio::time::sleep(resync) => {}
         }
-        if let Err(err) = reconcile_once(&client, &store, &pods, &mut trackers, &mut problems).await
+        if let Err(err) = reconcile_once(
+            &client,
+            &store,
+            &pods,
+            &mut trackers,
+            &mut problems,
+            dns_server,
+        )
+        .await
         {
             warn!(error = %format!("{err:#}"), "reconcile pass failed");
         }
@@ -190,6 +216,7 @@ async fn reconcile_once(
     pods: &cache::SharedPods,
     trackers: &mut Trackers,
     problems: &mut HashMap<String, String>,
+    dns_server: Option<Ipv4Addr>,
 ) -> anyhow::Result<()> {
     let snapshot: Vec<Pod> = pods.lock().await.values().cloned().collect();
 
@@ -223,12 +250,18 @@ async fn reconcile_once(
                 remove_container(store, &runtime_name).await;
             }
             Op::Start { uid } => {
-                start_container(store, &desired, &uid, trackers, problems, now_epoch).await;
+                start_container(
+                    store, &desired, &uid, trackers, problems, now_epoch, dns_server,
+                )
+                .await;
             }
             Op::Restart { uid, runtime_name } => {
                 debug!(container = %runtime_name, "restarting container");
                 remove_container(store, &runtime_name).await;
-                start_container(store, &desired, &uid, trackers, problems, now_epoch).await;
+                start_container(
+                    store, &desired, &uid, trackers, problems, now_epoch, dns_server,
+                )
+                .await;
             }
         }
     }
@@ -371,6 +404,7 @@ async fn start_container(
     trackers: &mut Trackers,
     problems: &mut HashMap<String, String>,
     now_epoch: u64,
+    dns_server: Option<Ipv4Addr>,
 ) {
     let Some(pod) = desired.iter().find(|d| d.uid == uid) else {
         return;
@@ -390,6 +424,8 @@ async fn start_container(
         command: run.command.clone(),
         args: run.args.clone(),
         pull: PullPolicy::Auto,
+        dns_server,
+        namespace: Some(pod.namespace.clone()),
     };
     match container::run(store, options).await {
         Ok(summary) => {

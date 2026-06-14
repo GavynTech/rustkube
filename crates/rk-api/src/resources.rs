@@ -214,6 +214,10 @@ async fn do_create(
     // The store stamps the authoritative resourceVersion.
     metadata.remove("resourceVersion");
 
+    if kind == ResourceKind::Service {
+        crate::services::allocate(state, &mut object.data).await?;
+    }
+
     let key = object.key();
     let stored = state.store.put(object, Some(0)).await.map_err(|err| {
         if matches!(err, rk_store::StoreError::Conflict { .. }) {

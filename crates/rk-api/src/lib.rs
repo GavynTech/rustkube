@@ -11,4 +11,5 @@ pub mod config;
 pub mod error;
 pub mod resources;
 pub mod server;
+pub mod services;
 pub mod watch;

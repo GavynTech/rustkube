@@ -74,10 +74,30 @@ pub fn headers(kind: ResourceKind, with_namespace: bool) -> Vec<&'static str> {
         ResourceKind::Node => headers.push("STATUS"),
         ResourceKind::Deployment => headers.extend(["READY", "UP-TO-DATE", "AVAILABLE"]),
         ResourceKind::ReplicaSet => headers.extend(["DESIRED", "CURRENT", "READY"]),
+        ResourceKind::Service => headers.extend(["TYPE", "CLUSTER-IP", "PORT(S)"]),
         _ => {}
     }
     headers.push("AGE");
     headers
+}
+
+/// kubectl-style `PORT(S)` column: `80/TCP`, or `80:30080/TCP` for NodePort.
+fn service_ports(object: &Value) -> String {
+    let Some(ports) = object.pointer("/spec/ports").and_then(Value::as_array) else {
+        return "<none>".to_owned();
+    };
+    ports
+        .iter()
+        .map(|p| {
+            let port = p.get("port").and_then(Value::as_u64).unwrap_or(0);
+            let proto = p.get("protocol").and_then(Value::as_str).unwrap_or("TCP");
+            match p.get("nodePort").and_then(Value::as_u64) {
+                Some(np) => format!("{port}:{np}/{proto}"),
+                None => format!("{port}/{proto}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// `<ready>/<desired>` the way kubectl renders workload readiness.
@@ -182,6 +202,19 @@ pub fn row(
             row.push(u64_field(object, "/spec/replicas"));
             row.push(u64_field(object, "/status/replicas"));
             row.push(u64_field(object, "/status/readyReplicas"));
+        }
+        ResourceKind::Service => {
+            row.push(
+                field(object, "/spec/type")
+                    .unwrap_or("ClusterIP")
+                    .to_owned(),
+            );
+            row.push(
+                field(object, "/spec/clusterIP")
+                    .unwrap_or("<none>")
+                    .to_owned(),
+            );
+            row.push(service_ports(object));
         }
         _ => {}
     }
@@ -303,7 +336,28 @@ mod tests {
             vec!["NAME", "READY", "UP-TO-DATE", "AVAILABLE", "AGE"]
         );
         assert_eq!(headers(ResourceKind::ReplicaSet, false).len(), 5);
+        assert_eq!(
+            headers(ResourceKind::Service, false),
+            vec!["NAME", "TYPE", "CLUSTER-IP", "PORT(S)", "AGE"]
+        );
         assert_eq!(headers(ResourceKind::ConfigMap, false), vec!["NAME", "AGE"]);
+    }
+
+    #[test]
+    fn service_rows_render_type_ip_and_ports() {
+        let now = Utc::now();
+        let svc = serde_json::json!({
+            "metadata": { "name": "web" },
+            "spec": {
+                "type": "NodePort",
+                "clusterIP": "10.96.0.10",
+                "ports": [{ "port": 80, "nodePort": 30080, "protocol": "TCP" }]
+            }
+        });
+        assert_eq!(
+            row(ResourceKind::Service, &svc, false, now),
+            vec!["web", "NodePort", "10.96.0.10", "80:30080/TCP", "<unknown>"]
+        );
     }
 
     #[test]

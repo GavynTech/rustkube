@@ -51,7 +51,9 @@ pub struct ServiceSpec {
     pub selector: BTreeMap<String, String>,
     pub ports: Vec<ServicePort>,
     /// Virtual IP, allocated by the API server from the service CIDR.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Kubernetes spells the acronym in caps — `clusterIP`, not the `clusterIp`
+    /// camelCase would produce — and the API allocator writes that spelling.
+    #[serde(rename = "clusterIP", skip_serializing_if = "Option::is_none")]
     pub cluster_ip: Option<Ipv4Addr>,
 }
 
@@ -118,6 +120,18 @@ spec:
         assert_eq!(service.spec.ports[0].node_port, Some(30080));
         assert_eq!(service.spec.ports[0].protocol, Protocol::Tcp);
         assert!(service.spec.cluster_ip.is_none(), "allocated server-side");
+    }
+
+    #[test]
+    fn cluster_ip_uses_the_kubernetes_spelling() {
+        // The API allocator and `kubectl` both write `clusterIP`; the typed
+        // model must round-trip that exact key, not camelCase `clusterIp`.
+        let service: Service =
+            serde_yaml::from_str("metadata:\n  name: web\nspec:\n  clusterIP: 10.96.0.10\n")
+                .unwrap();
+        assert_eq!(service.spec.cluster_ip, Some("10.96.0.10".parse().unwrap()));
+        let json = serde_json::to_value(&service).unwrap();
+        assert_eq!(json["spec"]["clusterIP"], "10.96.0.10");
     }
 
     #[test]

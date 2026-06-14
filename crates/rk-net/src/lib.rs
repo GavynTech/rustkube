@@ -6,7 +6,9 @@
 //! nodes ([`overlay`]). Services (nftables VIPs) and the embedded DNS server
 //! land here in Phase 6B.
 
+pub mod dns;
 pub mod overlay;
+pub mod service;
 
 use std::net::Ipv4Addr;
 

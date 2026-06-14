@@ -175,6 +175,8 @@ fn run_cli() -> anyhow::Result<()> {
                     command: entrypoint.map(|e| vec![e]),
                     args: (!args.is_empty()).then_some(args),
                     pull,
+                    dns_server: None,
+                    namespace: None,
                 },
             ))?;
             println!(

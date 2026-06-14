@@ -138,6 +138,19 @@ fn parse_slash24(cidr: &str) -> Result<Ipv4Addr> {
     Ok(Ipv4Addr::from(u32::from(addr) & 0xFFFF_FF00))
 }
 
+/// Ensure this node's bridge exists and return its gateway address. Called by
+/// the agent at startup so the bridge (and its gateway IP) is present before
+/// the embedded DNS server binds to it, rather than waiting for the first pod.
+pub async fn ensure_node_bridge(store: &Store) -> Result<Ipv4Addr> {
+    let base = base_of(&read_ipam(store)?);
+    let gateway = Ipv4Addr::from(u32::from(base) + GATEWAY_OCTET);
+    let (connection, handle, _) = rtnetlink::new_connection()
+        .map_err(|err| RuntimeError::net("opening netlink", err.to_string()))?;
+    tokio::spawn(connection);
+    ensure_bridge(&handle, gateway).await?;
+    Ok(gateway)
+}
+
 /// Hand out the lowest free pod IP (host octet) from this data dir's /24.
 /// Freed octets are reused before new ones are cut. Single-writer by
 /// construction (one agent owns one data dir).

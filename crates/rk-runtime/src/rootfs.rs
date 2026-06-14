@@ -107,6 +107,23 @@ pub fn write_etc_hosts(rootfs: &Path, name: &str, ip: &str) -> Result<()> {
         .map_err(|source| RuntimeError::io("writing /etc/hosts", &hosts, source))
 }
 
+/// Point the pod at the cluster DNS server (its node's gateway) and set the
+/// Kubernetes search list, so `curl http://service/` resolves to a VIP.
+/// `ndots:5` makes the resolver try the search domains for short names first.
+pub fn write_resolv_conf(rootfs: &Path, nameserver: &str, namespace: &str) -> Result<()> {
+    let etc = rootfs.join("etc");
+    fs::create_dir_all(&etc)
+        .map_err(|source| RuntimeError::io("creating /etc in rootfs", &etc, source))?;
+    let resolv = etc.join("resolv.conf");
+    let content = format!(
+        "nameserver {nameserver}\n\
+         search {namespace}.svc.cluster.local svc.cluster.local cluster.local\n\
+         options ndots:5\n"
+    );
+    fs::write(&resolv, content)
+        .map_err(|source| RuntimeError::io("writing /etc/resolv.conf", &resolv, source))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
