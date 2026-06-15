@@ -19,7 +19,7 @@ for the full specification.
 - [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
-- [~] Phase 7 — **7A** probes + logs (done); **7B** ingress + the website workload (next)
+- [~] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy (both done); deploying the website workload is gated on user confirmation
 - [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
 
 ## Layout
@@ -173,6 +173,27 @@ rk-ctl logs web-0          # container stdout/stderr from the node
 `scripts/phase7a-demo.sh` shows a probe-failing pod excluded from its
 service's endpoints, a liveness probe restarting a container, and `rk-ctl
 logs` (design notes in [docs/phase-7a-notes.md](docs/phase-7a-notes.md)).
+
+## Ingress (Phase 7B scope)
+
+`rk-ingress` watches Ingress and Service objects, builds a `(host, path) →
+ClusterIP:port` routing table, and reverse-proxies external HTTP on :80 to the
+matched service VIP — where the node's nftables rules load-balance onto ready
+pods. Most-specific match wins (named host over wildcard, longer prefix over
+shorter). It must run on a node that carries the service rules.
+
+```sh
+rk-ingress --api-url http://127.0.0.1:6443 --http-port 80 &
+rk-ctl apply -f ingress.yaml                       # host app.example.com → web:80
+curl -H "Host: app.example.com" http://<node>/     # → load-balanced across pods
+curl -H "Host: unknown" http://<node>/             # → 404 (no matching route)
+```
+
+`scripts/phase7b-demo.sh` deploys a whoami Service behind an Ingress and shows
+requests with the matching `Host` header load-balanced across backends while an
+unknown host gets a 404 (design notes in
+[docs/phase-7b-notes.md](docs/phase-7b-notes.md)). TLS termination from the
+Ingress `tls` section lands in Phase 8.
 
 ## Container runner (Phase 1 scope)
 
