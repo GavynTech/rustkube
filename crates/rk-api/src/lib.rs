@@ -7,6 +7,7 @@
 //! only component that touches the store; agents, controllers, the scheduler
 //! and the CLI all go through HTTP.
 
+pub mod auth;
 pub mod config;
 pub mod error;
 pub mod resources;

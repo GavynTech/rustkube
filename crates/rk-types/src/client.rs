@@ -41,6 +41,17 @@ pub enum ClientError {
     },
     #[error("watch stream error: {0}")]
     Watch(String),
+    #[error("client configuration: {0}")]
+    Config(String),
+}
+
+/// Credentials and trust for talking to `rk-api`: a bearer token sent on every
+/// request, and the CA certificate (PEM) that signed the server's TLS cert.
+/// Both default to `None` — a plaintext, unauthenticated dev cluster.
+#[derive(Default, Clone)]
+pub struct ClientAuth {
+    pub token: Option<String>,
+    pub ca_cert_pem: Option<Vec<u8>>,
 }
 
 pub type WatchStream<T> = Pin<Box<dyn Stream<Item = Result<WatchEvent<T>, ClientError>> + Send>>;
@@ -64,16 +75,65 @@ fn item_path(kind: ResourceKind, namespace: Option<&str>, name: &str) -> String 
 }
 
 impl ApiClient {
+    /// A client with no credentials and the system trust roots — for tests and
+    /// dev clusters with auth and TLS turned off.
     pub fn new(base: impl Into<String>) -> Result<Self, ClientError> {
+        Self::with_auth(base, ClientAuth::default())
+    }
+
+    /// A client that sends `Authorization: Bearer <token>` on every request (if
+    /// a token is set) and trusts `ca_cert_pem` in addition to the system roots,
+    /// so it can verify the API server's self-signed TLS certificate.
+    pub fn with_auth(base: impl Into<String>, auth: ClientAuth) -> Result<Self, ClientError> {
         let base = base.into().trim_end_matches('/').to_owned();
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .build()
-            .map_err(|source| ClientError::Http {
-                url: base.clone(),
-                source,
-            })?;
+        let mut builder =
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(3));
+        if let Some(token) = &auth.token {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| ClientError::Config("auth token has invalid characters".to_owned()))?;
+            value.set_sensitive(true);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        if let Some(pem) = &auth.ca_cert_pem {
+            let cert = reqwest::Certificate::from_pem(pem)
+                .map_err(|err| ClientError::Config(format!("invalid CA certificate: {err}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let http = builder.build().map_err(|source| ClientError::Http {
+            url: base.clone(),
+            source,
+        })?;
         Ok(ApiClient { base, http })
+    }
+
+    /// Build a client from a base URL and optional token / CA-cert file paths,
+    /// as the component configs carry them. A `None` path skips that credential;
+    /// a path that can't be read is an error.
+    pub fn connect(
+        base: impl Into<String>,
+        token_file: Option<&std::path::Path>,
+        ca_file: Option<&std::path::Path>,
+    ) -> Result<Self, ClientError> {
+        let token = match token_file {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|err| {
+                        ClientError::Config(format!("reading token {}: {err}", path.display()))
+                    })?
+                    .trim()
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        let ca_cert_pem = match ca_file {
+            Some(path) => Some(std::fs::read(path).map_err(|err| {
+                ClientError::Config(format!("reading CA cert {}: {err}", path.display()))
+            })?),
+            None => None,
+        };
+        Self::with_auth(base, ClientAuth { token, ca_cert_pem })
     }
 
     pub fn base_url(&self) -> &str {

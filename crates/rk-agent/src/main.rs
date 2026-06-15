@@ -92,7 +92,11 @@ async fn run_agent() -> anyhow::Result<()> {
         "rk-agent starting"
     );
 
-    let client = Arc::new(ApiClient::new(&config.api_url)?);
+    let client = Arc::new(ApiClient::connect(
+        &config.api_url,
+        config.token_file.as_deref(),
+        config.ca_file.as_deref(),
+    )?);
     let store = Store::new(&config.data_dir);
     store.ensure_layout()?;
     if let Some(cidr) = &config.pod_cidr {

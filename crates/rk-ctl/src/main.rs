@@ -1,9 +1,11 @@
 //! RustKube CLI. `apply`, `get` (with `--watch`), `describe` and `delete`
 //! ride the shared API client in `rk_types::client`; `logs` needs the node
-//! agent's log streaming (Phase 7), `scale` the controllers (Phase 5),
-//! `drain` Phase 8 — no dead flags in the meantime.
+//! agent's log streaming (Phase 7), `scale` the controllers (Phase 5), `pki`
+//! mints TLS material + a token offline (Phase 8); `drain` lands in 8B — no
+//! dead flags in the meantime.
 
 mod output;
+mod pki;
 
 use std::path::PathBuf;
 
@@ -25,6 +27,12 @@ struct Cli {
         default_value = "http://127.0.0.1:6443"
     )]
     api_url: String,
+    /// File holding the bearer token to send to the API server.
+    #[arg(long, global = true, env = "RK_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
+    /// PEM CA certificate that signed the API server's TLS cert.
+    #[arg(long, global = true, env = "RK_CA_FILE")]
+    ca_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -87,6 +95,29 @@ enum Command {
     },
     /// Print the client version and, when reachable, the server version.
     Version,
+    /// Generate TLS PKI (a CA + API server cert/key) and a bearer token.
+    /// Offline — it never contacts the API server.
+    Pki {
+        #[command(subcommand)]
+        command: PkiCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PkiCommand {
+    /// Write ca.crt, ca.key, server.crt, server.key and token into a directory.
+    Init {
+        /// Output directory (created if missing).
+        #[arg(long, default_value = "pki")]
+        dir: PathBuf,
+        /// DNS name or IP address the API server is reached at; repeatable.
+        /// `127.0.0.1` and `localhost` are always included.
+        #[arg(long = "api-name")]
+        api_names: Vec<String>,
+        /// Overwrite existing files instead of refusing.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -98,8 +129,25 @@ enum OutputFormat {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // `pki` is offline — handle it before building an API client.
+    if let Command::Pki { command } = &cli.command {
+        return match command {
+            PkiCommand::Init {
+                dir,
+                api_names,
+                force,
+            } => pki::init(dir, api_names, *force),
+        };
+    }
+
+    let client = ApiClient::connect(
+        &cli.api_url,
+        cli.token_file.as_deref(),
+        cli.ca_file.as_deref(),
+    )?;
     match cli.command {
-        Command::Apply { files } => apply(&cli.api_url, &files).await,
+        Command::Apply { files } => apply(&client, &files).await,
         Command::Get {
             kind,
             name,
@@ -109,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
             watch,
         } => {
             get(
-                &cli.api_url,
+                &client,
                 &kind,
                 name.as_deref(),
                 namespace.as_deref(),
@@ -123,20 +171,21 @@ async fn main() -> anyhow::Result<()> {
             kind,
             name,
             namespace,
-        } => describe(&cli.api_url, &kind, &name, namespace.as_deref()).await,
+        } => describe(&client, &kind, &name, namespace.as_deref()).await,
         Command::Delete {
             kind,
             name,
             namespace,
-        } => delete(&cli.api_url, &kind, &name, namespace.as_deref()).await,
-        Command::Logs { pod, namespace } => logs(&cli.api_url, &pod, namespace.as_deref()).await,
+        } => delete(&client, &kind, &name, namespace.as_deref()).await,
+        Command::Logs { pod, namespace } => logs(&client, &pod, namespace.as_deref()).await,
         Command::Scale {
             kind,
             name,
             replicas,
             namespace,
-        } => scale(&cli.api_url, &kind, &name, replicas, namespace.as_deref()).await,
-        Command::Version => version(&cli.api_url).await,
+        } => scale(&client, &kind, &name, replicas, namespace.as_deref()).await,
+        Command::Version => version(&client).await,
+        Command::Pki { .. } => unreachable!("handled before the client is built"),
     }
 }
 
@@ -197,8 +246,7 @@ fn parse_manifests(input: &str) -> anyhow::Result<Vec<Value>> {
     Ok(objects)
 }
 
-async fn apply(api_url: &str, files: &[PathBuf]) -> anyhow::Result<()> {
-    let client = ApiClient::new(api_url)?;
+async fn apply(client: &ApiClient, files: &[PathBuf]) -> anyhow::Result<()> {
     for file in files {
         let manifest = if file.as_os_str() == "-" {
             std::io::read_to_string(std::io::stdin()).context("reading stdin")?
@@ -246,7 +294,7 @@ async fn apply(api_url: &str, files: &[PathBuf]) -> anyhow::Result<()> {
 }
 
 async fn get(
-    api_url: &str,
+    client: &ApiClient,
     kind: &str,
     name: Option<&str>,
     namespace: Option<&str>,
@@ -255,7 +303,6 @@ async fn get(
     watch: bool,
 ) -> anyhow::Result<()> {
     let kind = parse_kind(kind)?;
-    let client = ApiClient::new(api_url)?;
 
     // Scope of the request: a single namespace unless -A (or cluster kind).
     let effective_ns = if all_namespaces || !kind.namespaced() {
@@ -327,13 +374,12 @@ async fn get(
 }
 
 async fn describe(
-    api_url: &str,
+    client: &ApiClient,
     kind: &str,
     name: &str,
     namespace: Option<&str>,
 ) -> anyhow::Result<()> {
     let kind = parse_kind(kind)?;
-    let client = ApiClient::new(api_url)?;
     let ns = kind.namespaced().then(|| namespace.unwrap_or("default"));
     let object = client
         .get_raw(kind, ns, name)
@@ -348,13 +394,12 @@ async fn describe(
 }
 
 async fn delete(
-    api_url: &str,
+    client: &ApiClient,
     kind: &str,
     name: &str,
     namespace: Option<&str>,
 ) -> anyhow::Result<()> {
     let kind = parse_kind(kind)?;
-    let client = ApiClient::new(api_url)?;
     let ns = kind.namespaced().then(|| namespace.unwrap_or("default"));
     client.delete_raw(kind, ns, name).await?;
     print_line(&format!(
@@ -365,7 +410,7 @@ async fn delete(
 }
 
 async fn scale(
-    api_url: &str,
+    client: &ApiClient,
     kind: &str,
     name: &str,
     replicas: u32,
@@ -375,7 +420,6 @@ async fn scale(
     if !matches!(kind, ResourceKind::Deployment | ResourceKind::ReplicaSet) {
         bail!("can only scale Deployments and ReplicaSets, not {kind}");
     }
-    let client = ApiClient::new(api_url)?;
     let ns = namespace.unwrap_or("default");
     // Read-modify-write the existing object at its current resourceVersion;
     // the server enforces the optimistic-concurrency check.
@@ -394,10 +438,9 @@ async fn scale(
 
 /// Fetch a pod's logs from the node running it: resolve pod → nodeName →
 /// node address, then GET the node agent's log endpoint.
-async fn logs(api_url: &str, pod: &str, namespace: Option<&str>) -> anyhow::Result<()> {
+async fn logs(client: &ApiClient, pod: &str, namespace: Option<&str>) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let client = ApiClient::new(api_url)?;
     let ns = namespace.unwrap_or("default");
     let pod_obj = client
         .get_raw(ResourceKind::Pod, Some(ns), pod)
@@ -437,16 +480,15 @@ async fn logs(api_url: &str, pod: &str, namespace: Option<&str>) -> anyhow::Resu
     Ok(())
 }
 
-async fn version(api_url: &str) -> anyhow::Result<()> {
+async fn version(client: &ApiClient) -> anyhow::Result<()> {
     print_line(&format!("client: rk-ctl v{}", env!("CARGO_PKG_VERSION")));
-    let client = ApiClient::new(api_url)?;
     match client.server_version().await {
         Ok(info) => print_line(&format!(
             "server: {} v{}",
             info["component"].as_str().unwrap_or("<unknown>"),
             info["version"].as_str().unwrap_or("<unknown>"),
         )),
-        Err(_) => print_line(&format!("server: unreachable at {api_url}")),
+        Err(_) => print_line(&format!("server: unreachable at {}", client.base_url())),
     }
     Ok(())
 }

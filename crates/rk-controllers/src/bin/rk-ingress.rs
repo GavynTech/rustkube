@@ -12,6 +12,7 @@
 //! to the backend. TLS termination (rustls, from the Ingress's TLS Secret) is
 //! noted in the design docs as the next step; this serves cleartext :80.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -34,6 +35,12 @@ struct Args {
     /// API server base URL.
     #[arg(long, env = "RK_API_URL", default_value = "http://127.0.0.1:6443")]
     api_url: String,
+    /// File holding the bearer token to present to the API server.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+    /// PEM CA certificate that signed the API server's TLS cert.
+    #[arg(long)]
+    ca_file: Option<PathBuf>,
     /// Port to serve HTTP on.
     #[arg(long, default_value_t = 80)]
     http_port: u16,
@@ -55,7 +62,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     info!(api_url = %args.api_url, port = args.http_port, "rk-ingress starting");
 
-    let client = Arc::new(ApiClient::new(&args.api_url)?);
+    let client = Arc::new(ApiClient::connect(
+        &args.api_url,
+        args.token_file.as_deref(),
+        args.ca_file.as_deref(),
+    )?);
     let routes: Routes = Arc::new(RwLock::new(Vec::new()));
     tokio::spawn(maintain_routes(client, routes.clone()));
 

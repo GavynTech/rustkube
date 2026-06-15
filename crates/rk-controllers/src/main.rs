@@ -55,7 +55,11 @@ async fn main() -> anyhow::Result<()> {
         "rk-controllers starting"
     );
 
-    let client = Arc::new(ApiClient::new(&config.api_url)?);
+    let client = Arc::new(ApiClient::connect(
+        &config.api_url,
+        config.token_file.as_deref(),
+        config.ca_file.as_deref(),
+    )?);
     let caches = Caches {
         deployments: Arc::default(),
         replicasets: Arc::default(),

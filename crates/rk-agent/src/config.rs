@@ -30,6 +30,12 @@ const fn default_resync_secs() -> u64 {
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentConfig {
     pub api_url: String,
+    /// File holding the bearer token to present to the API server (matches the
+    /// server's `authTokenFile`). Unset means no `Authorization` header.
+    pub token_file: Option<PathBuf>,
+    /// PEM CA certificate that signed the API server's TLS cert, so HTTPS to it
+    /// verifies. Unset means the system trust roots only.
+    pub ca_file: Option<PathBuf>,
     /// Node name to register as; defaults to the machine hostname.
     pub node_name: Option<String>,
     /// Root for image layers, container rootfs mounts and logs.
@@ -61,6 +67,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
             api_url: default_api_url(),
+            token_file: None,
+            ca_file: None,
             node_name: None,
             data_dir: default_data_dir(),
             node_ip: None,

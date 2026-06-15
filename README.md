@@ -20,7 +20,7 @@ for the full specification.
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
 - [x] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy, and a static site deployed through the ingress (real Flowdeck app deployable once its assets are provided)
-- [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
+- [~] Phase 8 — hardening: **8A** TLS + token auth across the control plane (done); **8B** ingress TLS + node drain, **8C** e2e suite + install script + systemd (next)
 
 ## Layout
 
@@ -203,6 +203,27 @@ ingress returns the page. The runtime has no volume mounts yet, so the page is
 written into nginx's web root at container start. Pointing a real app (the
 intended Flowdeck site) at the cluster is the same three objects with its image
 in place of nginx.
+
+## TLS + token auth (Phase 8A scope)
+
+`rk-ctl pki init` mints a CA, an API-server certificate, and a bearer token
+offline (rcgen + `/dev/urandom`, no openssl). With those in place rk-api serves
+HTTPS and requires `Authorization: Bearer <token>` on every request except
+`/healthz`; the agent, scheduler, controllers, ingress and CLI all carry the
+token and trust the CA. Both are opt-in — unset, the cluster stays plaintext and
+open as in earlier phases.
+
+```sh
+rk-ctl pki init --dir pki --api-name 10.0.0.5      # ca.crt, server.crt/key, token
+# rk-api config: authTokenFile + tls.certFile/keyFile
+# client config: tokenFile + caFile  (rk-ctl: --token-file/--ca-file)
+rk-ctl --token-file pki/token --ca-file pki/ca.crt get pods
+```
+
+`scripts/phase8a-demo.sh` shows the boundary (open `/healthz`, 401 without the
+token, 200 with it, plaintext and untrusted-cert requests refused) and then runs
+the whole control plane over HTTPS+token to schedule a pod (design notes in
+[docs/phase-8a-notes.md](docs/phase-8a-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

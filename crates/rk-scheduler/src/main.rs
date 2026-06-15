@@ -48,7 +48,11 @@ async fn main() -> anyhow::Result<()> {
         "rk-scheduler starting"
     );
 
-    let client = Arc::new(ApiClient::new(&config.api_url)?);
+    let client = Arc::new(ApiClient::connect(
+        &config.api_url,
+        config.token_file.as_deref(),
+        config.ca_file.as_deref(),
+    )?);
     let nodes: Cache<Node> = Arc::default();
     let pods: Cache<Pod> = Arc::default();
     let notify = Arc::new(Notify::new());

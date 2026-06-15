@@ -1,5 +1,7 @@
 //! Controller-manager configuration.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 fn default_api_url() -> String {
@@ -22,6 +24,10 @@ const fn default_pod_eviction_secs() -> u64 {
 #[serde(rename_all = "camelCase", default)]
 pub struct ControllersConfig {
     pub api_url: String,
+    /// File holding the bearer token to present to the API server.
+    pub token_file: Option<PathBuf>,
+    /// PEM CA certificate that signed the API server's TLS cert.
+    pub ca_file: Option<PathBuf>,
     /// Seconds between full reconcile sweeps (watch events also trigger one).
     pub resync_interval_secs: u64,
     /// A node whose last heartbeat is older than this is marked NotReady.
@@ -34,6 +40,8 @@ impl Default for ControllersConfig {
     fn default() -> Self {
         ControllersConfig {
             api_url: default_api_url(),
+            token_file: None,
+            ca_file: None,
             resync_interval_secs: default_resync_secs(),
             node_not_ready_secs: default_node_not_ready_secs(),
             pod_eviction_secs: default_pod_eviction_secs(),
