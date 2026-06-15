@@ -1,0 +1,8 @@
+[Unit]
+Description=RustKube single-node cluster (API, scheduler, controllers, agent, ingress)
+Documentation=https://github.com/GavynTech/rustkube
+Wants=rk-api.service rk-scheduler.service rk-controllers.service rk-agent.service rk-ingress.service
+After=rk-api.service
+
+[Install]
+WantedBy=multi-user.target

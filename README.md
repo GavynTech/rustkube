@@ -6,9 +6,10 @@ Linux namespaces/cgroups, pod networking with VXLAN + nftables service VIPs,
 ingress, and a kubectl-style CLI. Built phase by phase; see [SPEC.md](SPEC.md)
 for the full specification.
 
-> **Status: educational reference implementation.** Do not expose it to the
-> internet. TLS and authentication land in Phase 8; even then, this is a
-> learning system, not a production orchestrator.
+> **Status: educational reference implementation.** TLS and bearer-token auth
+> are in place (Phase 8), but this is a learning system — a single API server
+> over one sqlite store, one shared token, no RBAC or HA — not a production
+> orchestrator.
 
 ## Phase tracker
 
@@ -20,7 +21,40 @@ for the full specification.
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
 - [x] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy, and a static site deployed through the ingress (real Flowdeck app deployable once its assets are provided)
-- [~] Phase 8 — hardening: **8A** TLS + token auth across the control plane, **8B** ingress TLS termination + node drain (done); **8C** e2e suite + install script + systemd (next)
+- [x] Phase 8 — hardening: **8A** TLS + token auth across the control plane, **8B** ingress TLS termination + node drain, **8C** e2e suite + `install.sh` + systemd units + this diagram
+
+## Architecture
+
+```
+                 rk-ctl  (apply · get · scale · drain · logs · pki init)
+                    │  HTTPS + bearer token
+                    ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │                      rk-api  ( :6443, TLS )                │
+   │    REST + SSE watch · admission · optimistic concurrency   │
+   │                          rk-store (sqlite)                 │
+   └──────────────────────────────────────────────────────────┘
+       ▲             ▲              ▲                  ▲
+       │  list + watch (HTTPS + token), write back     │
+       │             │              │                  │
+  rk-scheduler  rk-controllers   rk-ingress       rk-agent ── per node ──┐
+  filter + bin   Deployment/RS    :80 + :443       reconcile pods        │
+  pack, bind     Node, GC,        host/path route  pull · run · probes   │
+  spec.nodeName  drain-aware      TLS from Secret   logs · report status │
+                                       │                    │            │
+                                       │ to ClusterIP       │ creates    │
+                                       ▼                    ▼            │
+                              nftables service VIP   ┌──────────────┐    │
+                              (DNAT + numgen LB) ───▶│ pods: netns, │    │
+                                       ▲             │ cgroups v2,  │    │
+                              VXLAN overlay (VNI 42) │ veth@rk-br0  │◀───┘
+                              + embedded DNS    ────▶└──────────────┘
+```
+
+Every component but the API server is a watcher: it lists+watches the objects it
+cares about over the same HTTPS+token client and writes decisions back. The
+control plane is pure-function reconcilers around one store; the data plane
+(service VIPs, the pod overlay, DNS) is programmed by the per-node agents.
 
 ## Layout
 
@@ -243,6 +277,25 @@ rk-ctl uncordon rk-node1     # node takes pods again
 `scripts/phase8b-demo.sh` serves a site over TLS through the ingress (verifying
 the cert, refusing it without the CA) and then drains and uncordons a node
 (design notes in [docs/phase-8b-notes.md](docs/phase-8b-notes.md)).
+
+## Install + end-to-end (Phase 8C scope)
+
+`scripts/install.sh` installs a secured single-node cluster as systemd services:
+it builds the binaries, generates the PKI, writes TLS+token configs, and drops
+the units from `deploy/systemd/` into place.
+
+```sh
+sudo scripts/install.sh --api-name 127.0.0.1
+sudo systemctl enable --now rustkube.target     # rk-api + scheduler + controllers + agent + ingress
+rk-ctl get nodes                                # Ready, over HTTPS + token
+```
+
+`scripts/e2e-cluster.sh` is the capstone test: it stands up a TLS+token cluster
+and asserts the auth boundary, a Deployment behind a ClusterIP Service and a TLS
+Ingress, service-VIP load-balancing, ingress TLS, scale, a rolling update,
+self-heal, logs, and a drain/uncordon cycle — every major feature at once
+(design notes in [docs/phase-8c-notes.md](docs/phase-8c-notes.md)).
+`scripts/e2e.sh` remains the fast, root-free Phase-2 API smoke test.
 
 ## Container runner (Phase 1 scope)
 

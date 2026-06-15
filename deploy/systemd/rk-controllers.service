@@ -1,0 +1,20 @@
+[Unit]
+Description=RustKube controller manager
+Documentation=https://github.com/GavynTech/rustkube
+After=rk-api.service
+Wants=rk-api.service
+PartOf=rustkube.target
+
+[Service]
+ExecStart=@BINDIR@/rk-controllers --config @CONFDIR@/controllers.yaml
+Restart=on-failure
+RestartSec=2
+User=root
+# Network-only: no writes, no extra privileges.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=rustkube.target

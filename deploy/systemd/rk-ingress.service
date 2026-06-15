@@ -1,0 +1,22 @@
+[Unit]
+Description=RustKube ingress controller + reverse proxy
+Documentation=https://github.com/GavynTech/rustkube
+After=rk-api.service
+Wants=rk-api.service
+PartOf=rustkube.target
+
+[Service]
+# Connects to the local API over TLS with the shared token; binds :80 and :443.
+ExecStart=@BINDIR@/rk-ingress --api-url https://127.0.0.1:6443 \
+    --token-file @CONFDIR@/pki/token --ca-file @CONFDIR@/pki/ca.crt \
+    --http-port 80 --https-port 443
+Restart=on-failure
+RestartSec=2
+User=root
+# Reads the PKI read-only and binds privileged ports; nothing to write.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=rustkube.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=RustKube API server
+Documentation=https://github.com/GavynTech/rustkube
+After=network-online.target
+Wants=network-online.target
+PartOf=rustkube.target
+
+[Service]
+ExecStart=@BINDIR@/rk-api --config @CONFDIR@/api.yaml
+Restart=on-failure
+RestartSec=2
+# The store and PKI under @CONFDIR@ are root-owned; run as root to read them.
+User=root
+# Modest hardening: the API server only writes its sqlite store; the PKI under
+# @CONFDIR@ stays read-only.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/rustkube
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=rustkube.target

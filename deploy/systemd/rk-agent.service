@@ -1,0 +1,19 @@
+[Unit]
+Description=RustKube node agent
+Documentation=https://github.com/GavynTech/rustkube
+After=rk-api.service
+Wants=rk-api.service
+PartOf=rustkube.target
+
+[Service]
+ExecStart=@BINDIR@/rk-agent --config @CONFDIR@/agent.yaml
+Restart=on-failure
+RestartSec=2
+# The agent runs containers: namespaces, cgroups, pivot_root, bridge/veth and
+# nftables all need real root and an unsandboxed view of the host. No
+# ProtectSystem / NoNewPrivileges here — they would break the runtime.
+User=root
+Delegate=yes
+
+[Install]
+WantedBy=rustkube.target
