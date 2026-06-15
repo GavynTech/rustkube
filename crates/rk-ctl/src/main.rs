@@ -1,8 +1,8 @@
 //! RustKube CLI. `apply`, `get` (with `--watch`), `describe` and `delete`
 //! ride the shared API client in `rk_types::client`; `logs` needs the node
 //! agent's log streaming (Phase 7), `scale` the controllers (Phase 5), `pki`
-//! mints TLS material + a token offline (Phase 8); `drain` lands in 8B — no
-//! dead flags in the meantime.
+//! mints TLS material + a token offline and `drain`/`cordon` gate a node
+//! (Phase 8) — no dead flags in the meantime.
 
 mod output;
 mod pki;
@@ -93,6 +93,12 @@ enum Command {
         #[arg(short = 'n', long)]
         namespace: Option<String>,
     },
+    /// Mark a node unschedulable; the scheduler places no new pods on it.
+    Cordon { node: String },
+    /// Reverse `cordon`, letting the node take pods again.
+    Uncordon { node: String },
+    /// Cordon a node and evict its pods so they reschedule elsewhere.
+    Drain { node: String },
     /// Print the client version and, when reachable, the server version.
     Version,
     /// Generate TLS PKI (a CA + API server cert/key) and a bearer token.
@@ -184,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
             replicas,
             namespace,
         } => scale(&client, &kind, &name, replicas, namespace.as_deref()).await,
+        Command::Cordon { node } => set_cordon(&client, &node, true).await,
+        Command::Uncordon { node } => set_cordon(&client, &node, false).await,
+        Command::Drain { node } => drain(&client, &node).await,
         Command::Version => version(&client).await,
         Command::Pki { .. } => unreachable!("handled before the client is built"),
     }
@@ -432,6 +441,67 @@ async fn scale(
     print_line(&format!(
         "{} \"{name}\" scaled to {replicas}",
         kind.as_str().to_lowercase()
+    ));
+    Ok(())
+}
+
+/// Set a node's `spec.unschedulable`; the scheduler's filter already honors it.
+async fn set_cordon(client: &ApiClient, node: &str, unschedulable: bool) -> anyhow::Result<()> {
+    let mut obj = client
+        .get_raw(ResourceKind::Node, None, node)
+        .await?
+        .with_context(|| format!("node {node:?} not found"))?;
+    obj.as_object_mut()
+        .context("node object is malformed")?
+        .entry("spec")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("node spec is malformed")?
+        .insert("unschedulable".to_owned(), unschedulable.into());
+    client
+        .replace_raw(ResourceKind::Node, None, node, &obj)
+        .await?;
+    print_line(&format!(
+        "node \"{node}\" {}",
+        if unschedulable {
+            "cordoned"
+        } else {
+            "uncordoned"
+        }
+    ));
+    Ok(())
+}
+
+/// Cordon `node`, then delete every pod scheduled to it. The controllers
+/// recreate managed pods, and since the node is now unschedulable they land on
+/// other nodes; bare pods are simply removed.
+async fn drain(client: &ApiClient, node: &str) -> anyhow::Result<()> {
+    set_cordon(client, node, true).await?;
+    let pods = client.list_raw(ResourceKind::Pod, None).await?;
+    let on_node: Vec<&Value> = pods
+        .items
+        .iter()
+        .filter(|pod| pod.pointer("/spec/nodeName").and_then(Value::as_str) == Some(node))
+        .collect();
+    if on_node.is_empty() {
+        print_line(&format!("node \"{node}\" drained (no pods to evict)"));
+        return Ok(());
+    }
+    for pod in &on_node {
+        let name = pod
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let ns = pod
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("default");
+        client.delete_raw(ResourceKind::Pod, Some(ns), name).await?;
+        print_line(&format!("evicting pod {ns}/{name}"));
+    }
+    print_line(&format!(
+        "node \"{node}\" drained ({} pod(s) evicted)",
+        on_node.len()
     ));
     Ok(())
 }

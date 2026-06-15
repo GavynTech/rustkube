@@ -13,6 +13,7 @@ pub mod config;
 pub mod deployment;
 pub mod gc;
 pub mod ingress;
+pub mod ingress_tls;
 pub mod node;
 pub mod replicaset;
 pub mod support;

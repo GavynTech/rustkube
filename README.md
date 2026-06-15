@@ -20,7 +20,7 @@ for the full specification.
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
 - [x] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy, and a static site deployed through the ingress (real Flowdeck app deployable once its assets are provided)
-- [~] Phase 8 — hardening: **8A** TLS + token auth across the control plane (done); **8B** ingress TLS + node drain, **8C** e2e suite + install script + systemd (next)
+- [~] Phase 8 — hardening: **8A** TLS + token auth across the control plane, **8B** ingress TLS termination + node drain (done); **8C** e2e suite + install script + systemd (next)
 
 ## Layout
 
@@ -224,6 +224,25 @@ rk-ctl --token-file pki/token --ca-file pki/ca.crt get pods
 token, 200 with it, plaintext and untrusted-cert requests refused) and then runs
 the whole control plane over HTTPS+token to schedule a pod (design notes in
 [docs/phase-8a-notes.md](docs/phase-8a-notes.md)).
+
+## Ingress TLS + node drain (Phase 8B scope)
+
+The ingress now serves HTTPS on :443, terminating TLS with a certificate loaded
+from the Ingress's `tls` Secret and selected by SNI, then proxying cleartext to
+the backend exactly as on :80. `rk-ctl drain` cordons a node (so the scheduler
+stops placing pods there) and evicts its pods so the controllers reschedule them
+elsewhere; `cordon`/`uncordon` are the halves.
+
+```sh
+# Ingress with a tls section referencing a kubernetes.io/tls Secret -> :443
+curl --resolve shop.example.com:443:127.0.0.1 --cacert ca.crt https://shop.example.com/
+rk-ctl drain rk-node1        # cordons, evicts pods (get nodes shows SchedulingDisabled)
+rk-ctl uncordon rk-node1     # node takes pods again
+```
+
+`scripts/phase8b-demo.sh` serves a site over TLS through the ingress (verifying
+the cert, refusing it without the CA) and then drains and uncordons a node
+(design notes in [docs/phase-8b-notes.md](docs/phase-8b-notes.md)).
 
 ## Container runner (Phase 1 scope)
 

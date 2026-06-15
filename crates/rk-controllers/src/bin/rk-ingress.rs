@@ -1,28 +1,29 @@
 //! `rk-ingress` — the ingress controller and reverse proxy.
 //!
-//! It watches Ingress and Service objects, keeps a routing table of
-//! `(host, path) -> service ClusterIP:port`, and serves HTTP on port 80,
-//! forwarding each request to the matched service's virtual IP (where the
-//! node's nftables rules load-balance it onto a backing pod). It must run on
-//! a node that carries those service rules.
+//! It watches Ingress, Service and Secret objects, keeps a routing table of
+//! `(host, path) -> service ClusterIP:port`, and serves HTTP on :80 and HTTPS
+//! on :443, forwarding each request to the matched service's virtual IP (where
+//! the node's nftables rules load-balance it onto a backing pod). It must run
+//! on a node that carries those service rules.
 //!
 //! The proxy is hand-rolled HTTP/1.1 over tokio — the same minimal-dependency
-//! style as the agent's DNS and log servers — rather than pulling in a
-//! framework: it reads the request head to route, then splices the connection
-//! to the backend. TLS termination (rustls, from the Ingress's TLS Secret) is
-//! noted in the design docs as the next step; this serves cleartext :80.
+//! style as the agent's DNS and log servers. On :443 it terminates TLS with
+//! rustls, choosing the certificate by SNI from the Ingress `tls` Secrets (see
+//! `ingress_tls`), then runs the identical cleartext proxy to the backend.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use rk_controllers::ingress::{self, Route};
+use rk_controllers::ingress_tls::{self, SniResolver};
 use rk_types::client::ApiClient;
 use rk_types::client::reflector::{self, Cache};
-use rk_types::{Ingress, Service};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use rk_types::{Ingress, Secret, Service};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, RwLock};
+use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
@@ -41,9 +42,12 @@ struct Args {
     /// PEM CA certificate that signed the API server's TLS cert.
     #[arg(long)]
     ca_file: Option<PathBuf>,
-    /// Port to serve HTTP on.
+    /// Port to serve cleartext HTTP on.
     #[arg(long, default_value_t = 80)]
     http_port: u16,
+    /// Port to serve HTTPS on (TLS terminated from Ingress `tls` Secrets).
+    #[arg(long, default_value_t = 443)]
+    https_port: u16,
 }
 
 type Routes = Arc<RwLock<Vec<Route>>>;
@@ -60,7 +64,7 @@ const RESP_502: &[u8] =
 async fn main() -> anyhow::Result<()> {
     rk_types::bootstrap::init_tracing()?;
     let args = Args::parse();
-    info!(api_url = %args.api_url, port = args.http_port, "rk-ingress starting");
+    info!(api_url = %args.api_url, http = args.http_port, https = args.https_port, "rk-ingress starting");
 
     let client = Arc::new(ApiClient::connect(
         &args.api_url,
@@ -68,10 +72,23 @@ async fn main() -> anyhow::Result<()> {
         args.ca_file.as_deref(),
     )?);
     let routes: Routes = Arc::new(RwLock::new(Vec::new()));
-    tokio::spawn(maintain_routes(client, routes.clone()));
 
+    // TLS: one rustls config whose SNI resolver the watcher keeps current.
+    // rustls 0.23 needs a process-wide crypto provider chosen explicitly.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let resolver = Arc::new(SniResolver::default());
+    let tls = TlsAcceptor::from(ingress_tls::server_config(resolver.clone()));
+
+    tokio::spawn(maintain_routes(client, routes.clone(), resolver));
+
+    // HTTPS listener: terminate TLS, then run the same proxy over the stream.
+    let https = TcpListener::bind(("0.0.0.0", args.https_port)).await?;
+    info!(port = args.https_port, "ingress HTTPS listening");
+    tokio::spawn(serve_https(https, tls, routes.clone()));
+
+    // HTTP listener.
     let listener = TcpListener::bind(("0.0.0.0", args.http_port)).await?;
-    info!(port = args.http_port, "ingress proxy listening");
+    info!(port = args.http_port, "ingress HTTP listening");
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
@@ -85,31 +102,67 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Watch Ingress + Service and rebuild the routing table on every change.
-async fn maintain_routes(client: Arc<ApiClient>, routes: Routes) {
+/// Accept TLS connections, terminate the handshake, then proxy the plaintext.
+async fn serve_https(listener: TcpListener, tls: TlsAcceptor, routes: Routes) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let (tls, routes) = (tls.clone(), routes.clone());
+        tokio::spawn(async move {
+            match tls.accept(stream).await {
+                Ok(stream) => {
+                    if let Err(err) = proxy(stream, routes).await {
+                        tracing::debug!(error = %err, "https proxy connection ended");
+                    }
+                }
+                Err(err) => tracing::debug!(error = %err, "tls handshake failed"),
+            }
+        });
+    }
+}
+
+/// Watch Ingress + Service + Secret and rebuild both the routing table and the
+/// TLS certificate map on every change.
+async fn maintain_routes(client: Arc<ApiClient>, routes: Routes, resolver: Arc<SniResolver>) {
     let ingresses: Cache<Ingress> = Arc::default();
     let services: Cache<Service> = Arc::default();
+    let secrets: Cache<Secret> = Arc::default();
     let notify = Arc::new(Notify::new());
     tokio::spawn(reflector::reflect(
         client.clone(),
         ingresses.clone(),
         notify.clone(),
     ));
-    tokio::spawn(reflector::reflect(client, services.clone(), notify.clone()));
+    tokio::spawn(reflector::reflect(
+        client.clone(),
+        services.clone(),
+        notify.clone(),
+    ));
+    tokio::spawn(reflector::reflect(client, secrets.clone(), notify.clone()));
 
     loop {
         notify.notified().await;
         let ing = reflector::snapshot(&ingresses).await;
         let svc = reflector::snapshot(&services).await;
+        let sec = reflector::snapshot(&secrets).await;
         let table = ingress::build_routes(&ing, &svc);
-        let count = table.len();
+        let routes_count = table.len();
         *routes.write().await = table;
-        tracing::debug!(routes = count, "ingress routing table rebuilt");
+        let certs = ingress_tls::build_certs(&ing, &sec);
+        let tls_hosts = certs.len();
+        resolver.replace(certs);
+        tracing::debug!(routes = routes_count, tls_hosts, "ingress tables rebuilt");
     }
 }
 
 /// Read just enough of the request to route it, then splice to the backend.
-async fn proxy(mut client: TcpStream, routes: Routes) -> std::io::Result<()> {
+/// Generic over the client stream so it serves both plain TCP (:80) and a
+/// TLS-terminated stream (:443) with one body.
+async fn proxy<S>(mut client: S, routes: Routes) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Read the request head (up to the blank line), capped so a slow or
     // oversized client can't hold the connection open forever.
     let mut head = Vec::new();

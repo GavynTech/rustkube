@@ -201,11 +201,18 @@ pub fn row(
             );
         }
         ResourceKind::Node => {
-            row.push(
-                field(object, "/status/condition")
-                    .unwrap_or("Unknown")
-                    .to_owned(),
-            );
+            let mut status = field(object, "/status/condition")
+                .unwrap_or("Unknown")
+                .to_owned();
+            // kubectl appends this when the node is cordoned.
+            if object
+                .pointer("/spec/unschedulable")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                status.push_str(",SchedulingDisabled");
+            }
+            row.push(status);
         }
         ResourceKind::Deployment => {
             row.push(ready_fraction(object, "/spec/replicas"));
