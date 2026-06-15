@@ -19,7 +19,7 @@ for the full specification.
 - [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
 - [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
 - [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
-- [~] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy (both done); deploying the website workload is gated on user confirmation
+- [x] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy, and a static site deployed through the ingress (real Flowdeck app deployable once its assets are provided)
 - [ ] Phase 8 — hardening (TLS, tokens, drain, e2e suite, install script, systemd)
 
 ## Layout
@@ -194,6 +194,15 @@ requests with the matching `Host` header load-balanced across backends while an
 unknown host gets a 404 (design notes in
 [docs/phase-7b-notes.md](docs/phase-7b-notes.md)). TLS termination from the
 Ingress `tls` section lands in Phase 8.
+
+`scripts/website-demo.sh` puts the whole stack together end to end: it deploys a
+real static landing page (`examples/website/index.html`) as a 2-replica nginx
+Deployment behind a ClusterIP Service and an Ingress for `rustkube.local`, then
+fetches it the way a browser would — `curl -H "Host: rustkube.local"` through the
+ingress returns the page. The runtime has no volume mounts yet, so the page is
+written into nginx's web root at container start. Pointing a real app (the
+intended Flowdeck site) at the cluster is the same three objects with its image
+in place of nginx.
 
 ## Container runner (Phase 1 scope)
 
