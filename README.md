@@ -6,23 +6,6 @@ Linux namespaces/cgroups, pod networking with VXLAN + nftables service VIPs,
 ingress, and a kubectl-style CLI. Built phase by phase; see [SPEC.md](SPEC.md)
 for the full specification.
 
-> **Status: educational reference implementation.** TLS and bearer-token auth
-> are in place (Phase 8), but this is a learning system — a single API server
-> over one sqlite store, one shared token, no RBAC or HA — not a production
-> orchestrator.
-
-## Phase tracker
-
-- [x] Phase 0 — workspace scaffold: all crates, shared types, config loading, logging, Makefile
-- [x] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
-- [x] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
-- [x] Phase 3 — node agent (reconcile assigned pods, report status)
-- [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
-- [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
-- [x] Phase 6 — networking: bridge/veth + VXLAN overlay (6A) + service VIPs + DNS (6B)
-- [x] Phase 7 — **7A** probes + logs, **7B** ingress reverse proxy, and a static site deployed through the ingress (real Flowdeck app deployable once its assets are provided)
-- [x] Phase 8 — hardening: **8A** TLS + token auth across the control plane, **8B** ingress TLS termination + node drain, **8C** e2e suite + `install.sh` + systemd units + this diagram
-
 ## Architecture
 
 ```
