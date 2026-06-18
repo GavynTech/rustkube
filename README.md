@@ -1,10 +1,10 @@
 # RustKube
 
-A Kubernetes-style container orchestration platform written entirely in Rust —
-API server, scheduler, controllers, a from-scratch OCI container runtime on raw
-Linux namespaces/cgroups, pod networking with VXLAN + nftables service VIPs,
-ingress, and a kubectl-style CLI. Built phase by phase; see [SPEC.md](SPEC.md)
-for the full specification.
+A Kubernetes-style container orchestration platform written entirely in Rust:
+an HTTPS API server over a sqlite store, a scheduler, workload controllers, a
+from-scratch OCI container runtime on raw Linux namespaces/cgroups, pod
+networking with a VXLAN overlay and nftables service VIPs, an ingress reverse
+proxy, and a kubectl-style CLI.
 
 ## Architecture
 
@@ -34,26 +34,30 @@ for the full specification.
                               + embedded DNS    ────▶└──────────────┘
 ```
 
-Every component but the API server is a watcher: it lists+watches the objects it
-cares about over the same HTTPS+token client and writes decisions back. The
-control plane is pure-function reconcilers around one store; the data plane
-(service VIPs, the pod overlay, DNS) is programmed by the per-node agents.
+Every component but the API server is a watcher: it lists and watches the
+objects it cares about over the same HTTPS+token client and writes its decisions
+back. The control plane is pure-function reconcilers around one store; the data
+plane — service VIPs, the pod overlay, DNS — is programmed by the per-node
+agents.
 
-## Layout
+## Crates
 
 | Crate | Kind | Role |
 |---|---|---|
 | `crates/rk-types` | lib | resource model (Pod, Deployment, …), quantities, config/tracing bootstrap |
-| `crates/rk-store` | lib | `Store` trait + the sqlite implementation (revisions, change log, watch fan-out) |
+| `crates/rk-store` | lib | `Store` trait + sqlite implementation (revisions, change log, watch fan-out) |
 | `crates/rk-api` | bin | control-plane API server (axum) |
 | `crates/rk-scheduler` | bin | pod → node placement (filter + most-allocated bin packing, nodeSelector) |
 | `crates/rk-controllers` | bin | Deployment/ReplicaSet/Node controllers + owner-ref GC |
-| `crates/rk-runtime` | lib | OCI image + container lifecycle |
+| `crates/rk-runtime` | lib | OCI image pull + container lifecycle |
 | `crates/rk-net` | lib | VXLAN overlay, nftables service VIPs, embedded DNS server |
 | `crates/rk-agent` | bin | per-node kubelet equivalent |
 | `crates/rk-ctl` | bin | CLI |
 
-## Quickstart (Phase 2 scope)
+## Getting started
+
+Building and image pulls work anywhere. **Running containers needs root,
+cgroups v2 and overlayfs** — use the Ubuntu 24.04 VM, never the dev workstation.
 
 ```sh
 make build      # compile the whole workspace
@@ -68,21 +72,44 @@ rk-ctl describe pod web-0              # full object as YAML
 rk-ctl delete pod web-0
 
 make dev-down
-make e2e        # scripted end-to-end test of all of the above
 ```
 
-(`rk-ctl` is `./target/debug/rk-ctl`; `alias rk-ctl=$PWD/target/debug/rk-ctl`
-makes the above read as written.) `RUST_LOG` controls verbosity (e.g.
+`rk-ctl` is `./target/debug/rk-ctl`; `alias rk-ctl=$PWD/target/debug/rk-ctl`
+makes the commands read as written. `RUST_LOG` controls verbosity (e.g.
 `RUST_LOG=debug make dev-up`). Component config files live in
-`config/<component>.yaml`; an explicit `--config <path>` or
-`RK_CONFIG=<path>` overrides the default search.
+`config/<component>.yaml`; an explicit `--config <path>` or `RK_CONFIG=<path>`
+overrides the default search.
 
-## Node agent (Phase 3 scope)
+## Capabilities
 
-On the Ubuntu VM, as root: start `rk-api` and `rk-agent`, and pods bound to
-the node (via `spec.nodeName` — the scheduler arrives in Phase 4) actually
-run, report status, self-heal per their restart policy, and tear down on
-delete:
+### Container runtime
+
+`rkrt` is the development CLI over `rk-runtime` — a from-scratch OCI runtime: a
+digest-verified image pull from Docker Hub, then containers isolated with Linux
+namespaces, cgroups v2 limits, and an overlayfs rootfs.
+
+```sh
+cargo build --release -p rk-runtime          # builds target/release/rkrt
+rkrt pull nginx                              # digest-verified pull from Docker Hub
+rkrt run --name web --memory 256Mi --cpus 500m nginx
+curl http://10.42.0.6/                       # nginx, from the VM host
+rkrt ps && rkrt logs web
+rkrt stop web && rkrt rm web
+```
+
+### Control plane, store, and CLI
+
+`rk-api` is an axum REST server with SSE watch streams, admission, and
+optimistic concurrency, backed by `rk-store` over sqlite (monotonic revisions, a
+change log, and watch fan-out). `rk-ctl` is the kubectl-style client:
+`apply`/`get`/`describe`/`delete`/`scale`/`drain`/`logs`. See the quickstart
+above.
+
+### Node agent
+
+`rk-agent` is the per-node kubelet equivalent: it registers its node, reconciles
+the pods bound to it (pull, run, report status, self-heal per restart policy),
+and tears them down on delete.
 
 ```sh
 ./target/release/rk-api  &       # control plane
@@ -94,141 +121,97 @@ curl http://10.42.0.6/
 rk-ctl delete pod web-0
 ```
 
-`scripts/phase3-demo.sh` runs the full loop — registration, pull, run, curl,
-kill-and-self-heal, run-to-completion, teardown (design notes in
-[docs/phase-3-notes.md](docs/phase-3-notes.md)).
-
-## Multi-node + scheduler (Phase 4 scope)
+### Scheduling
 
 `rk-scheduler` watches for unbound pods and places them by free CPU/memory
-(most-allocated bin packing) and `nodeSelector`, writing the binding back; a
-pod that fits nowhere is left Pending with the reason in its status. On the
-VM, a second node is simulated as an agent in its own network namespace
-(`scripts/sim-node.sh`), each node carving pods from its own /24:
+(most-allocated bin packing) and `nodeSelector`, writing the binding back. A pod
+that fits nowhere stays Pending with the reason in its status.
 
 ```sh
 rk-ctl get nodes                 # rk-node1 Ready / rk-node2 Ready
 rk-ctl apply -f some-pods.yaml   # no nodeName — the scheduler assigns one
 rk-ctl get pods                  # NODE column shows the placement
-# a pod requesting more than any node has stays Pending:
 rk-ctl describe pod huge         # status.message: 0/2 nodes available: 2 Insufficient cpu
 ```
 
-`scripts/phase4-demo.sh` brings up both nodes and demonstrates bin packing,
-`nodeSelector` steering, an unschedulable pod, and pods actually running on
-each node in its own pod network (design notes in
-[docs/phase-4-notes.md](docs/phase-4-notes.md)).
-
-## Controllers (Phase 5 scope)
+### Workload controllers
 
 `rk-controllers` reconciles the workload resources: a Deployment owns a
 ReplicaSet per template revision, a ReplicaSet keeps N pods alive, and a Node
-controller marks dead nodes and reschedules their pods. Owner-reference
-garbage collection makes deletes cascade.
+controller marks dead nodes and reschedules their pods. Owner-reference garbage
+collection makes deletes cascade.
 
 ```sh
 rk-ctl apply -f examples/deployment.yaml   # Deployment → ReplicaSet → 3 Pods
 rk-ctl get deployments                     # web   3/3   3   3
-rk-ctl get rs                              # web-<hash>  3  3  3
 rk-ctl delete pod <one>                    # the ReplicaSet recreates it
 rk-ctl scale deployment web --replicas=5   # two more pods appear
 # edit the image/template and re-apply → a rolling update (maxUnavailable/maxSurge)
 rk-ctl delete deployment web               # GC removes its ReplicaSets, then Pods
 ```
 
-`scripts/phase5-demo.sh` runs the lot on the two-node VM cluster: deploy,
-self-heal, scale up/down, a rolling update, node-death rescheduling, and
-cascade delete (design notes in [docs/phase-5-notes.md](docs/phase-5-notes.md)).
-
-## Pod networking (Phase 6A scope)
+### Pod networking
 
 Each node runs a Linux bridge (`rk-br0`) that its pods' veths land on, so
 same-node pods share an L2 segment. Cross-node traffic rides a VXLAN overlay
-(`rk-vxlan0`): every agent advertises its tunnel endpoint (VTEP MAC) on its
-Node and programs route/neighbour/FDB entries for each peer from the Node
-list — flannel's unicast model, no flooding.
+(`rk-vxlan0`): every agent advertises its tunnel endpoint (VTEP MAC) on its Node
+and programs route/neighbour/FDB entries for each peer from the Node list —
+flannel's unicast model, no flooding.
 
-`scripts/phase6a-demo.sh` pins an nginx pod to each of the two nodes and
-shows a pod on node1 curling a pod on node2 over the tunnel (both ways), plus
-same-node connectivity over the bridge (design notes in
-[docs/phase-6a-notes.md](docs/phase-6a-notes.md)).
-
-## Services + DNS (Phase 6B scope)
+### Services and DNS
 
 A Service gets a stable ClusterIP (allocated from 10.96.0.0/16 at admission);
-every node's agent watches Services and Pods, computes the ready endpoints,
-and programs an nftables table that DNATs the VIP to a backing pod
-(load-balanced with `numgen random`). Each agent also runs a small embedded
-DNS server on its bridge gateway — which the runtime writes into every pod's
-`/etc/resolv.conf` — resolving `service.namespace` to its ClusterIP.
+every node's agent watches Services and Pods, computes the ready endpoints, and
+programs an nftables table that DNATs the VIP to a backing pod (load-balanced
+with `numgen random`). Each agent also runs a small embedded DNS server on its
+bridge gateway — written into every pod's `/etc/resolv.conf` by the runtime —
+resolving `service.namespace` to its ClusterIP.
 
 ```sh
 rk-ctl apply -f app-and-service.yaml   # a Deployment + a ClusterIP Service
 rk-ctl get services                    # whoami  ClusterIP  10.96.0.10  80/TCP
-# from inside any pod:
-curl http://whoami/                     # name → DNS → VIP → nftables → a backend
+curl http://whoami/                     # from any pod: name → DNS → VIP → nftables → backend
 ```
 
-`scripts/phase6b-demo.sh` fronts a Deployment of `whoami` pods (spread across
-both nodes) with a ClusterIP Service, resolves it by name from a client pod,
-and curls the VIP to show load-balancing across backends on both nodes via
-the overlay (design notes in [docs/phase-6b-notes.md](docs/phase-6b-notes.md)).
+### Probes and logs
 
-## Probes + logs (Phase 7A scope)
-
-The agent runs liveness and readiness probes (`httpGet`, `tcpSocket`, `exec`).
-A readiness probe gates the pod's container `ready` status — and since
-services key endpoints on readiness, a not-ready pod receives no traffic; a
-liveness failure restarts the container. `rk-ctl logs <pod>` fetches a pod's
-output from the node running it.
+The agent runs liveness and readiness probes (`httpGet`, `tcpSocket`, `exec`). A
+readiness probe gates the container's `ready` status — and since services key
+endpoints on readiness, a not-ready pod receives no traffic; a liveness failure
+restarts the container. `rk-ctl logs <pod>` fetches a pod's output from the node
+running it.
 
 ```sh
 rk-ctl get pods            # READY column reflects readiness probes (1/1, 0/1)
 rk-ctl logs web-0          # container stdout/stderr from the node
 ```
 
-`scripts/phase7a-demo.sh` shows a probe-failing pod excluded from its
-service's endpoints, a liveness probe restarting a container, and `rk-ctl
-logs` (design notes in [docs/phase-7a-notes.md](docs/phase-7a-notes.md)).
-
-## Ingress (Phase 7B scope)
+### Ingress
 
 `rk-ingress` watches Ingress and Service objects, builds a `(host, path) →
-ClusterIP:port` routing table, and reverse-proxies external HTTP on :80 to the
-matched service VIP — where the node's nftables rules load-balance onto ready
-pods. Most-specific match wins (named host over wildcard, longer prefix over
-shorter). It must run on a node that carries the service rules.
+ClusterIP:port` routing table, and reverse-proxies external HTTP on :80 (and
+HTTPS on :443, terminating TLS from the Ingress's `tls` Secret by SNI) onto the
+matched service VIP, where nftables load-balances across ready pods.
+Most-specific match wins (named host over wildcard, longer prefix over shorter).
+It must run on a node that carries the service rules.
 
 ```sh
-rk-ingress --api-url http://127.0.0.1:6443 --http-port 80 &
+rk-ingress --api-url https://127.0.0.1:6443 --http-port 80 &
 rk-ctl apply -f ingress.yaml                       # host app.example.com → web:80
 curl -H "Host: app.example.com" http://<node>/     # → load-balanced across pods
 curl -H "Host: unknown" http://<node>/             # → 404 (no matching route)
+# with a tls section referencing a kubernetes.io/tls Secret → :443
+curl --resolve shop.example.com:443:127.0.0.1 --cacert ca.crt https://shop.example.com/
 ```
 
-`scripts/phase7b-demo.sh` deploys a whoami Service behind an Ingress and shows
-requests with the matching `Host` header load-balanced across backends while an
-unknown host gets a 404 (design notes in
-[docs/phase-7b-notes.md](docs/phase-7b-notes.md)). TLS termination from the
-Ingress `tls` section lands in Phase 8.
-
-`scripts/website-demo.sh` puts the whole stack together end to end: it deploys a
-real static landing page (`examples/website/index.html`) as a 2-replica nginx
-Deployment behind a ClusterIP Service and an Ingress for `rustkube.local`, then
-fetches it the way a browser would — `curl -H "Host: rustkube.local"` through the
-ingress returns the page. The runtime has no volume mounts yet, so the page is
-written into nginx's web root at container start. Pointing a real app (the
-intended Flowdeck site) at the cluster is the same three objects with its image
-in place of nginx.
-
-## TLS + token auth (Phase 8A scope)
+### TLS and token auth
 
 `rk-ctl pki init` mints a CA, an API-server certificate, and a bearer token
 offline (rcgen + `/dev/urandom`, no openssl). With those in place rk-api serves
 HTTPS and requires `Authorization: Bearer <token>` on every request except
 `/healthz`; the agent, scheduler, controllers, ingress and CLI all carry the
 token and trust the CA. Both are opt-in — unset, the cluster stays plaintext and
-open as in earlier phases.
+open.
 
 ```sh
 rk-ctl pki init --dir pki --api-name 10.0.0.5      # ca.crt, server.crt/key, token
@@ -237,31 +220,18 @@ rk-ctl pki init --dir pki --api-name 10.0.0.5      # ca.crt, server.crt/key, tok
 rk-ctl --token-file pki/token --ca-file pki/ca.crt get pods
 ```
 
-`scripts/phase8a-demo.sh` shows the boundary (open `/healthz`, 401 without the
-token, 200 with it, plaintext and untrusted-cert requests refused) and then runs
-the whole control plane over HTTPS+token to schedule a pod (design notes in
-[docs/phase-8a-notes.md](docs/phase-8a-notes.md)).
+### Node drain
 
-## Ingress TLS + node drain (Phase 8B scope)
-
-The ingress now serves HTTPS on :443, terminating TLS with a certificate loaded
-from the Ingress's `tls` Secret and selected by SNI, then proxying cleartext to
-the backend exactly as on :80. `rk-ctl drain` cordons a node (so the scheduler
-stops placing pods there) and evicts its pods so the controllers reschedule them
-elsewhere; `cordon`/`uncordon` are the halves.
+`rk-ctl drain` cordons a node (the scheduler stops placing pods there) and
+evicts its pods so the controllers reschedule them elsewhere. `cordon` and
+`uncordon` are the halves.
 
 ```sh
-# Ingress with a tls section referencing a kubernetes.io/tls Secret -> :443
-curl --resolve shop.example.com:443:127.0.0.1 --cacert ca.crt https://shop.example.com/
 rk-ctl drain rk-node1        # cordons, evicts pods (get nodes shows SchedulingDisabled)
 rk-ctl uncordon rk-node1     # node takes pods again
 ```
 
-`scripts/phase8b-demo.sh` serves a site over TLS through the ingress (verifying
-the cert, refusing it without the CA) and then drains and uncordons a node
-(design notes in [docs/phase-8b-notes.md](docs/phase-8b-notes.md)).
-
-## Install + end-to-end (Phase 8C scope)
+## Install (single-node, systemd)
 
 `scripts/install.sh` installs a secured single-node cluster as systemd services:
 it builds the binaries, generates the PKI, writes TLS+token configs, and drops
@@ -273,27 +243,40 @@ sudo systemctl enable --now rustkube.target     # rk-api + scheduler + controlle
 rk-ctl get nodes                                # Ready, over HTTPS + token
 ```
 
-`scripts/e2e-cluster.sh` is the capstone test: it stands up a TLS+token cluster
-and asserts the auth boundary, a Deployment behind a ClusterIP Service and a TLS
-Ingress, service-VIP load-balancing, ingress TLS, scale, a rolling update,
-self-heal, logs, and a drain/uncordon cycle — every major feature at once
-(design notes in [docs/phase-8c-notes.md](docs/phase-8c-notes.md)).
-`scripts/e2e.sh` remains the fast, root-free Phase-2 API smoke test.
+## Demos and tests
 
-## Container runner (Phase 1 scope)
+Each capability has a runnable demo script and design notes:
 
-`rkrt` is the development CLI over `rk-runtime`. Pulling works anywhere;
-running containers needs root, cgroups v2 and overlayfs — i.e. the Ubuntu
-24.04 VM, never the dev workstation:
+| Script | Shows | Notes |
+|---|---|---|
+| `scripts/phase1-demo.sh` | container pull/run/logs/stop loop | [phase-1](docs/phase-1-notes.md) |
+| `scripts/phase3-demo.sh` | agent registration, run, self-heal, teardown | [phase-3](docs/phase-3-notes.md) |
+| `scripts/phase4-demo.sh` | two-node bin packing, nodeSelector, unschedulable pod | [phase-4](docs/phase-4-notes.md) |
+| `scripts/phase5-demo.sh` | self-heal, scale, rolling update, node-death reschedule, cascade delete | [phase-5](docs/phase-5-notes.md) |
+| `scripts/phase6a-demo.sh` | cross-node pod connectivity over the VXLAN overlay | [phase-6a](docs/phase-6a-notes.md) |
+| `scripts/phase6b-demo.sh` | ClusterIP Service, DNS resolution, VIP load-balancing | [phase-6b](docs/phase-6b-notes.md) |
+| `scripts/phase7a-demo.sh` | readiness gating endpoints, liveness restart, logs | [phase-7a](docs/phase-7a-notes.md) |
+| `scripts/phase7b-demo.sh` | Ingress host routing + 404 on unknown host | [phase-7b](docs/phase-7b-notes.md) |
+| `scripts/website-demo.sh` | static site behind Service + Ingress, end to end | — |
+| `scripts/phase8a-demo.sh` | TLS+token auth boundary, full control plane over HTTPS | [phase-8a](docs/phase-8a-notes.md) |
+| `scripts/phase8b-demo.sh` | ingress TLS termination, node drain/uncordon | [phase-8b](docs/phase-8b-notes.md) |
 
-```sh
-cargo build --release -p rk-runtime          # builds target/release/rkrt
-rkrt pull nginx                              # digest-verified pull from Docker Hub
-rkrt run --name web --memory 256Mi --cpus 500m nginx
-curl http://10.42.0.6/                       # nginx, from the VM host
-rkrt ps && rkrt logs web
-rkrt stop web && rkrt rm web
-```
+End-to-end tests:
 
-`scripts/phase1-demo.sh` runs that whole loop end to end (design notes in
-[docs/phase-1-notes.md](docs/phase-1-notes.md)).
+- `scripts/e2e.sh` — fast, root-free Phase-2 API smoke test (`make e2e`).
+- `scripts/e2e-cluster.sh` — the capstone: a TLS+token cluster asserting the auth
+  boundary, a Deployment behind a ClusterIP Service and TLS Ingress, VIP
+  load-balancing, scale, rolling update, self-heal, logs, and drain/uncordon —
+  every major feature at once ([phase-8c](docs/phase-8c-notes.md)).
+
+## Build status
+
+- [x] Phase 0 — workspace scaffold: crates, shared types, config, logging, Makefile
+- [x] Phase 1 — single-node container runner (pull + namespaces + cgroups + rootfs)
+- [x] Phase 2 — API server + sqlite store + CLI (apply/get/delete/watch)
+- [x] Phase 3 — node agent (reconcile assigned pods, report status)
+- [x] Phase 4 — multi-node + scheduler (bin packing, nodeSelector)
+- [x] Phase 5 — controllers (Deployment/ReplicaSet, self-healing, rolling updates, scale)
+- [x] Phase 6 — networking: bridge/veth + VXLAN overlay, service VIPs + DNS
+- [x] Phase 7 — probes + logs, ingress reverse proxy
+- [x] Phase 8 — hardening: TLS + token auth, ingress TLS termination, node drain, install + e2e
