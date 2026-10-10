@@ -16,3 +16,10 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Control console
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/.env.local
+frontend/.env.*.local

@@ -69,6 +69,24 @@ rk-ctl delete pod web-0
 make dev-down
 ```
 
+### Web console
+
+![RustKube dashboard showing cluster overview and workload pipeline in demo mode](docs/images/rustkube-console.png)
+
+The read-only [RustKube console](frontend/README.md) visualizes deployments,
+ReplicaSets, pods, nodes, and service endpoints. Start with its labeled demo
+cluster or connect it to the existing API:
+
+```sh
+cd frontend
+npm ci
+npm run dev                  # http://127.0.0.1:5173
+```
+
+Use the console's Connection page and `frontend/.env.local` to configure a live
+API. Tokens and trusted CA files stay on the local console server. Deployment
+and node operations continue through `rk-ctl`.
+
 ## Architecture
 
 ```mermaid
