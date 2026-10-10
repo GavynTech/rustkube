@@ -6,8 +6,6 @@ This is the governing spec for RustKube, captured verbatim from the master promp
 ## Locked decisions (2026-06-10)
 
 - **Timing:** full send — all nine phases, gated on "next".
-- **Authorship:** Claude writes the implementation; this repo is a reference
-  implementation to be studied phase by phase.
 - **Environment:** development on the Fedora 43 workstation; root-dependent
   phases (1, 6+) run on an Ubuntu 24.04 x86_64 VM/VPS as root. Cluster never
   runs on the daily machine.
