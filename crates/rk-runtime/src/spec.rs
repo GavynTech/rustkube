@@ -14,6 +14,8 @@ use crate::error::{Result, RuntimeError};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSpec {
+    #[serde(default)]
+    pub mounts: Vec<crate::volumes::BindMount>,
     pub name: String,
     pub id: String,
     /// Host path of the mounted overlay rootfs.

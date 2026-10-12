@@ -498,7 +498,6 @@ fn event_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoreEvent, StoreErro
 
 #[cfg(test)]
 mod tests {
-    use futures_util::StreamExt as _;
 
     use super::*;
 

@@ -397,3 +397,116 @@ spec:
         assert!(pod.spec.containers[0].resources.requests.is_empty());
     }
 }
+
+/// Validation shared by API admission and the node agent. Only directory
+/// hostPath and emptyDir volumes are implemented; fail explicitly otherwise.
+pub fn validate_volumes(spec: &PodSpec) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    let mut names = BTreeSet::new();
+    for volume in &spec.volumes {
+        let name = &volume.name;
+        if name.is_empty()
+            || name.len() > 63
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(
+                "volume names must contain 1..63 lowercase letters, digits or hyphens".into(),
+            );
+        }
+        if !names.insert(name.as_str()) {
+            return Err(format!("duplicate volume {name}"));
+        }
+        let sources = usize::from(volume.host_path.is_some())
+            + usize::from(volume.empty_dir.is_some())
+            + usize::from(volume.config_map.is_some())
+            + usize::from(volume.secret.is_some());
+        if sources != 1 {
+            return Err(format!("volume {name} must have exactly one source"));
+        }
+        if volume.config_map.is_some() || volume.secret.is_some() {
+            return Err(
+                "ConfigMap/Secret file volumes are not supported; use environment references"
+                    .into(),
+            );
+        }
+        if let Some(host) = &volume.host_path {
+            validate_absolute_directory(&host.path)?;
+        }
+    }
+    for container in &spec.containers {
+        let mut paths = Vec::<&str>::new();
+        for mount in &container.volume_mounts {
+            if !names.contains(mount.name.as_str()) {
+                return Err(format!("unknown volume {}", mount.name));
+            }
+            validate_mount_path(&mount.mount_path)?;
+            let path = std::path::Path::new(&mount.mount_path);
+            if paths.iter().any(|previous| {
+                path.starts_with(previous) || std::path::Path::new(previous).starts_with(path)
+            }) {
+                return Err("duplicate or nested volume mount paths are not supported".into());
+            }
+            paths.push(&mount.mount_path);
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_absolute_directory(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path == "/"
+        || path.contains('\0')
+        || path
+            .split('/')
+            .skip(1)
+            .any(|p| p.is_empty() || p == "." || p == "..")
+    {
+        return Err(format!(
+            "expected a normalized absolute directory path other than /: {path:?}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_mount_path(path: &str) -> Result<(), String> {
+    validate_absolute_directory(path)?;
+    if ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|p| std::path::Path::new(path).starts_with(p))
+    {
+        return Err("mount paths under /proc, /sys and /dev are reserved".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+    fn spec() -> PodSpec {
+        serde_yaml::from_str("containers:\n- name: sim\n  image: sim\n  volumeMounts:\n  - name: results\n    mountPath: /results\nvolumes:\n- name: results\n  hostPath:\n    path: /srv/results\n").unwrap()
+    }
+    #[test]
+    fn validates_references_sources_and_paths() {
+        assert!(validate_volumes(&spec()).is_ok());
+        let mut s = spec();
+        s.volumes[0].empty_dir = Some(EmptyDirVolumeSource {});
+        assert!(validate_volumes(&s).is_err());
+        let mut s = spec();
+        s.containers[0].volume_mounts[0].name = "missing".into();
+        assert!(validate_volumes(&s).is_err());
+        for path in [
+            "/", "relative", "/a/../b", "/a/./b", "/a//b", "/dev/shm", "/proc/a", "/sys",
+        ] {
+            let mut s = spec();
+            s.containers[0].volume_mounts[0].mount_path = path.into();
+            assert!(validate_volumes(&s).is_err(), "{path}");
+        }
+        let mut s = spec();
+        let mut nested = s.containers[0].volume_mounts[0].clone();
+        nested.mount_path = "/results/nested".into();
+        s.containers[0].volume_mounts.push(nested);
+        assert!(validate_volumes(&s).is_err());
+    }
+}

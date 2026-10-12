@@ -27,6 +27,7 @@ pub mod registry;
 pub mod rootfs;
 pub mod spec;
 pub mod store;
+pub mod volumes;
 
 pub use error::{Result, RuntimeError};
 pub use image::{ImageRef, ImageRefError, Reference};

@@ -96,6 +96,24 @@ fn prepare(
         )));
     }
 
+    match &object {
+        AnyObject::Job(job) => {
+            job.spec.validate().map_err(ApiError::BadRequest)?;
+            rk_types::pod::validate_volumes(&job.spec.template.spec)
+                .map_err(ApiError::BadRequest)?;
+        }
+        AnyObject::Pod(pod) => {
+            rk_types::pod::validate_volumes(&pod.spec).map_err(ApiError::BadRequest)?
+        }
+        AnyObject::Deployment(d) => {
+            rk_types::pod::validate_volumes(&d.spec.template.spec).map_err(ApiError::BadRequest)?
+        }
+        AnyObject::ReplicaSet(rs) => {
+            rk_types::pod::validate_volumes(&rs.spec.template.spec).map_err(ApiError::BadRequest)?
+        }
+        _ => {}
+    }
+
     let meta = object.metadata();
     validate_name("name", &meta.name)?;
     if let Some(expected) = path_name
@@ -132,6 +150,10 @@ fn prepare(
     // Re-root the normalized namespace into the stored JSON so reads always
     // show where the object actually lives.
     let mut data = body;
+    if let AnyObject::Job(job) = &object {
+        data["spec"] =
+            serde_json::to_value(&job.spec).map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
     if let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) {
         match &namespace {
             Some(ns) => {
@@ -205,6 +227,10 @@ async fn do_create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let mut object = prepare(kind, path_ns, None, body)?;
 
+    if kind == ResourceKind::Job {
+        object.data["status"] = serde_json::to_value(rk_types::JobStatus::default())
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
     let metadata = meta_mut(&mut object.data)?;
     metadata.insert("uid".to_owned(), Value::String(generate_uid()?));
     metadata.insert(
@@ -248,6 +274,50 @@ async fn do_update(
                 object.key()
             ))
         })?;
+
+    if kind == ResourceKind::Job && object.data.get("spec") != current.data.get("spec") {
+        return Err(ApiError::BadRequest(
+            "Job spec is immutable; create a new Job for a new experiment".into(),
+        ));
+    }
+
+    if kind == ResourceKind::Job {
+        // Reapplying a manifest must not erase the ledger or restart a finished
+        // batch. Status progress is monotonic, even after attempt pod cleanup.
+        let previous: rk_types::JobStatus = serde_json::from_value(
+            current
+                .data
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let mut next: rk_types::JobStatus = serde_json::from_value(
+            object
+                .data
+                .get("status")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if object.data.get("status").is_none() {
+            next = previous.clone();
+        }
+        next.completed_indexes.extend(previous.completed_indexes);
+        for (index, attempts) in previous.failed_attempts {
+            next.failed_attempts
+                .entry(index)
+                .or_default()
+                .extend(attempts);
+        }
+        if previous.phase != rk_types::JobPhase::Running {
+            next.phase = previous.phase;
+        }
+        next.succeeded = next.completed_indexes.len() as u32;
+        next.failed = next.failed.max(previous.failed);
+        object.data["status"] =
+            serde_json::to_value(next).map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
 
     // The client's resourceVersion (when given) is the optimistic-concurrency
     // token; uid and creationTimestamp are server-owned and survive replaces

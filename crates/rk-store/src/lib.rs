@@ -80,6 +80,10 @@ pub enum StoreError {
     Backend(String),
 }
 
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed futures"
+)]
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + 'static {
     /// Insert or update an object. With `expected_revision: Some(rev)` the

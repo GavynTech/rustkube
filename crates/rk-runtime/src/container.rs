@@ -30,6 +30,7 @@ pub enum PullPolicy {
 
 #[derive(Debug)]
 pub struct RunOptions {
+    pub mounts: Vec<crate::volumes::Mount>,
     pub name: String,
     pub image: String,
     pub limits: cgroup::Limits,
@@ -200,6 +201,7 @@ async fn start_prepared(
 ) -> Result<RunSummary> {
     let container_dir = container_dir.to_path_buf();
     let rootfs_path = rootfs::mount_rootfs(store, &container_dir, &record.layers)?;
+    let mounts = crate::volumes::prepare(store, &opts.name, &opts.mounts)?;
     let pod_net = net::allocate(store)?;
 
     // The address block is only recorded in state.json near the end, so
@@ -210,6 +212,7 @@ async fn start_prepared(
         &container_dir,
         id,
         rootfs_path,
+        mounts,
         pod_net,
         argv,
         env,
@@ -231,6 +234,7 @@ async fn start_networked(
     container_dir: &Path,
     id: &str,
     rootfs_path: PathBuf,
+    mounts: Vec<crate::volumes::BindMount>,
     pod_net: net::PodNet,
     argv: Vec<String>,
     env: Vec<String>,
@@ -244,6 +248,7 @@ async fn start_networked(
     }
 
     let runtime_spec = RuntimeSpec {
+        mounts,
         name: opts.name.clone(),
         id: id.to_owned(),
         rootfs: rootfs_path.clone(),

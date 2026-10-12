@@ -4,6 +4,7 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::Job;
 use crate::cluster::{Namespace, Node};
 use crate::data::{ConfigMap, Secret};
 use crate::ingress::Ingress;
@@ -21,6 +22,7 @@ use crate::workloads::{Deployment, ReplicaSet};
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)] // resources legitimately differ in size; boxing would complicate every match for negligible gain
 pub enum AnyObject {
+    Job(Job),
     Pod(Pod),
     ReplicaSet(ReplicaSet),
     Deployment(Deployment),
@@ -35,6 +37,7 @@ pub enum AnyObject {
 impl AnyObject {
     pub fn kind(&self) -> ResourceKind {
         match self {
+            AnyObject::Job(_) => ResourceKind::Job,
             AnyObject::Pod(_) => ResourceKind::Pod,
             AnyObject::ReplicaSet(_) => ResourceKind::ReplicaSet,
             AnyObject::Deployment(_) => ResourceKind::Deployment,
@@ -49,6 +52,7 @@ impl AnyObject {
 
     pub fn metadata(&self) -> &ObjectMeta {
         match self {
+            AnyObject::Job(o) => &o.metadata,
             AnyObject::Pod(o) => &o.metadata,
             AnyObject::ReplicaSet(o) => &o.metadata,
             AnyObject::Deployment(o) => &o.metadata,
@@ -91,6 +95,7 @@ pub enum ApplyError {
 impl Serialize for AnyObject {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
+            AnyObject::Job(o) => o.serialize(serializer),
             AnyObject::Pod(o) => o.serialize(serializer),
             AnyObject::ReplicaSet(o) => o.serialize(serializer),
             AnyObject::Deployment(o) => o.serialize(serializer),
@@ -124,6 +129,7 @@ impl<'de> Deserialize<'de> for AnyObject {
         }
 
         Ok(match kind {
+            ResourceKind::Job => AnyObject::Job(dispatch(value)?),
             ResourceKind::Pod => AnyObject::Pod(dispatch(value)?),
             ResourceKind::ReplicaSet => AnyObject::ReplicaSet(dispatch(value)?),
             ResourceKind::Deployment => AnyObject::Deployment(dispatch(value)?),

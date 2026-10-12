@@ -90,6 +90,7 @@ impl LabelSelector {
 /// Every resource kind RustKube knows about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ResourceKind {
+    Job,
     Pod,
     ReplicaSet,
     Deployment,
@@ -102,7 +103,8 @@ pub enum ResourceKind {
 }
 
 impl ResourceKind {
-    pub const ALL: [ResourceKind; 9] = [
+    pub const ALL: [ResourceKind; 10] = [
+        ResourceKind::Job,
         ResourceKind::Pod,
         ResourceKind::ReplicaSet,
         ResourceKind::Deployment,
@@ -116,6 +118,7 @@ impl ResourceKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            ResourceKind::Job => "Job",
             ResourceKind::Pod => "Pod",
             ResourceKind::ReplicaSet => "ReplicaSet",
             ResourceKind::Deployment => "Deployment",
@@ -131,6 +134,7 @@ impl ResourceKind {
     /// Lowercase plural, used in API paths (`/api/v1/pods`) and by the CLI.
     pub fn plural(self) -> &'static str {
         match self {
+            ResourceKind::Job => "jobs",
             ResourceKind::Pod => "pods",
             ResourceKind::ReplicaSet => "replicasets",
             ResourceKind::Deployment => "deployments",

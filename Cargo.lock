@@ -2214,10 +2214,13 @@ name = "rk-controllers"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
  "rcgen",
+ "rk-api",
+ "rk-store",
  "rk-types",
  "rustls",
  "rustls-pemfile",

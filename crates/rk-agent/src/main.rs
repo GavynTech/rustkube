@@ -238,6 +238,7 @@ async fn reconcile_once(
     let empty_secrets = BTreeMap::new();
     let desired: Vec<DesiredPod> = snapshot
         .iter()
+        .filter(|pod| pod.status.message.as_deref() != Some(rk_types::job::EVICTED_ATTEMPT_MESSAGE))
         .filter_map(|pod| {
             let ns = pod.metadata.namespace_or_default();
             reconcile::desire(
@@ -258,6 +259,11 @@ async fn reconcile_once(
             Op::Teardown { runtime_name } => {
                 debug!(container = %runtime_name, "tearing down orphan container");
                 remove_container(store, &runtime_name).await;
+                if !store.container_dir(&runtime_name).exists()
+                    && let Err(err) = rk_runtime::volumes::cleanup(store, &runtime_name)
+                {
+                    warn!(error = %err, "emptyDir cleanup failed");
+                }
             }
             Op::Start { uid } => {
                 start_container(
@@ -291,6 +297,24 @@ async fn reconcile_once(
         .iter()
         .map(|c| (c.runtime_name.as_str(), c))
         .collect();
+    // A failed start may have prepared scratch storage without leaving a
+    // container. Sweep those directories too once the pod is gone.
+    let volume_root = store.root().join("volumes");
+    if volume_root.exists() {
+        for entry in std::fs::read_dir(&volume_root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let wanted = desired
+                .iter()
+                .any(|d| d.plan.as_ref().is_ok_and(|r| r.runtime_name == name));
+            if names::parse_runtime_name(&name).is_some()
+                && !wanted
+                && !by_name.contains_key(name.as_str())
+            {
+                rk_runtime::volumes::cleanup(store, &name)?;
+            }
+        }
+    }
     problems.retain(|uid, _| desired.iter().any(|d| &d.uid == uid));
 
     for pod in &snapshot {
@@ -505,6 +529,7 @@ async fn start_container(
 
     info!(pod = %pod.name, container = %run.runtime_name, image = %run.image, "starting container");
     let options = RunOptions {
+        mounts: run.mounts.clone(),
         name: run.runtime_name.clone(),
         image: run.image.clone(),
         limits: run.limits,

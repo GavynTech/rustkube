@@ -16,6 +16,9 @@ Docker daemon.
 - **Workload orchestration** — resource-aware scheduling, node selectors,
   Deployments, ReplicaSets, scaling, rolling updates, and owner-reference garbage
   collection.
+- **Finite simulation batches** — indexed Jobs with bounded parallelism, per-index retries,
+  durable completion tracking, and host-directory/temporary volumes. See the
+  [simulation guide](docs/simulation-jobs.md) and [example](examples/simulation/job.yaml).
 - **Container runtime** — digest-verified OCI image pulls, overlayfs root
   filesystems, Linux namespace isolation, and cgroups v2 resource limits.
 - **Cluster networking** — bridge/veth pod networking, a cross-node VXLAN

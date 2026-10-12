@@ -70,6 +70,7 @@ pub fn headers(kind: ResourceKind, with_namespace: bool) -> Vec<&'static str> {
     };
     headers.push("NAME");
     match kind {
+        ResourceKind::Job => headers.extend(["STATUS", "SUCCEEDED", "ACTIVE", "FAILED"]),
         ResourceKind::Pod => headers.extend(["READY", "STATUS", "RESTARTS", "IP", "NODE"]),
         ResourceKind::Node => headers.push("STATUS"),
         ResourceKind::Deployment => headers.extend(["READY", "UP-TO-DATE", "AVAILABLE"]),
@@ -213,6 +214,16 @@ pub fn row(
                 status.push_str(",SchedulingDisabled");
             }
             row.push(status);
+        }
+        ResourceKind::Job => {
+            row.push(
+                field(object, "/status/phase")
+                    .unwrap_or("Running")
+                    .to_owned(),
+            );
+            row.push(u64_field(object, "/status/succeeded"));
+            row.push(u64_field(object, "/status/active"));
+            row.push(u64_field(object, "/status/failed"));
         }
         ResourceKind::Deployment => {
             row.push(ready_fraction(object, "/spec/replicas"));

@@ -14,6 +14,7 @@ pub mod deployment;
 pub mod gc;
 pub mod ingress;
 pub mod ingress_tls;
+pub mod job;
 pub mod node;
 pub mod replicaset;
 pub mod support;

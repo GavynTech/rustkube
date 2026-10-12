@@ -7,6 +7,8 @@ pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("invalid volume: {0}")]
+    InvalidVolume(String),
     #[error(transparent)]
     ImageRef(#[from] crate::image::ImageRefError),
 

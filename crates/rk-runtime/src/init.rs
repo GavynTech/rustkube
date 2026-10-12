@@ -144,6 +144,7 @@ fn setup_and_exec(spec: &RuntimeSpec) -> Result<Never> {
         None,
     )?;
     populate_dev(rootfs)?;
+    crate::volumes::install(rootfs, &spec.mounts)?;
 
     // The pivot_root(".", ".") idiom: with new and old root the same mount,
     // the old root ends up stacked underneath and one lazy unmount drops it

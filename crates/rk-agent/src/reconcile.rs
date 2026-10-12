@@ -25,6 +25,7 @@ const STABLE_RUN_SECS: i64 = 60;
 /// What the agent wants to exist for one pod — or why it can't.
 #[derive(Debug)]
 pub struct DesiredPod {
+    pub terminal_status: Option<PodStatus>,
     pub uid: String,
     pub uid12: String,
     pub namespace: String,
@@ -39,6 +40,7 @@ pub struct DesiredPod {
 
 #[derive(Debug, Clone)]
 pub struct ContainerToRun {
+    pub mounts: Vec<rk_runtime::volumes::Mount>,
     pub runtime_name: String,
     pub container_name: String,
     pub image: String,
@@ -120,6 +122,9 @@ pub fn plan(
             // torn down by the orphan sweep below
         };
         wanted_names.insert(run.runtime_name.as_str(), ());
+        if pod.terminal_status.is_some() {
+            continue;
+        }
         let gate_open = trackers
             .get(&run.runtime_name)
             .is_none_or(|t| now_epoch >= t.not_before);
@@ -215,6 +220,9 @@ pub fn pod_status(
     problem: Option<&str>,
     readiness: Option<bool>,
 ) -> PodStatus {
+    if let Some(status) = &pod.terminal_status {
+        return status.clone();
+    }
     let mut message_parts: Vec<String> = pod.notes.clone();
     let restart_count = tracker.map_or(0, |t| t.restarts.saturating_sub(1));
 
@@ -339,11 +347,31 @@ pub fn desire(
                 names::MAX_CONTAINER_NAME
             ));
         }
-        if !pod.spec.volumes.is_empty() || !container.volume_mounts.is_empty() {
-            return Err("unsupported: volumes arrive later".to_owned());
-        }
+        rk_types::pod::validate_volumes(&pod.spec)?;
+        let mounts = container
+            .volume_mounts
+            .iter()
+            .map(|m| {
+                let v = pod
+                    .spec
+                    .volumes
+                    .iter()
+                    .find(|v| v.name == m.name)
+                    .ok_or_else(|| format!("unknown volume {}", m.name))?;
+                let source = match &v.host_path {
+                    Some(host) => rk_runtime::volumes::Source::HostPath(host.path.clone().into()),
+                    None => rk_runtime::volumes::Source::EmptyDir(v.name.clone()),
+                };
+                Ok(rk_runtime::volumes::Mount {
+                    source,
+                    target: m.mount_path.clone(),
+                    read_only: m.read_only,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
         Ok(ContainerToRun {
+            mounts,
             runtime_name: names::runtime_name(&uid, &container.name),
             container_name: container.name.clone(),
             image: container.image.clone(),
@@ -360,6 +388,9 @@ pub fn desire(
     })();
 
     Some(DesiredPod {
+        terminal_status: (pod.spec.restart_policy == RestartPolicy::Never
+            && matches!(pod.status.phase, PodPhase::Succeeded | PodPhase::Failed))
+        .then(|| pod.status.clone()),
         uid,
         uid12,
         namespace,
@@ -801,5 +832,29 @@ mod tests {
         assert_eq!(run.limits.cpu.unwrap().as_millis(), 500);
         assert_eq!(run.limits.memory.unwrap().as_bytes(), 256 << 20);
         assert_eq!(run.runtime_name, RT_NAME);
+    }
+}
+
+#[cfg(test)]
+mod finite_tests {
+    use super::*;
+    #[test]
+    fn completed_never_pod_does_not_restart_when_runtime_state_is_missing() {
+        let pod: Pod = serde_yaml::from_str("metadata:\n  name: sim\n  uid: abc123abc123abc123abc123abc123ab\nspec:\n  restartPolicy: Never\n  containers:\n  - name: sim\n    image: alpine\nstatus:\n  phase: Succeeded\n").unwrap();
+        let desired = desire(&pod, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        assert!(plan(std::slice::from_ref(&desired), &[], &Trackers::new(), 0).is_empty());
+        assert_eq!(
+            pod_status(&desired, None, None, None, None).phase,
+            PodPhase::Succeeded
+        );
+    }
+    #[test]
+    fn directory_mounts_reach_the_runtime_plan() {
+        let pod: Pod = serde_yaml::from_str("metadata:\n  name: sim\n  uid: abc123abc123abc123abc123abc123ab\nspec:\n  containers:\n  - name: sim\n    image: alpine\n    volumeMounts:\n    - name: results\n      mountPath: /results\n      readOnly: true\n  volumes:\n  - name: results\n    hostPath:\n      path: /srv/results\n").unwrap();
+        let desired = desire(&pod, &BTreeMap::new(), &BTreeMap::new()).unwrap();
+        let run = desired.plan.unwrap();
+        assert_eq!(run.mounts.len(), 1);
+        assert!(run.mounts[0].read_only);
+        assert_eq!(run.mounts[0].target, "/results");
     }
 }

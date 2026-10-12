@@ -496,7 +496,25 @@ async fn drain(client: &ApiClient, node: &str) -> anyhow::Result<()> {
             .pointer("/metadata/namespace")
             .and_then(Value::as_str)
             .unwrap_or("default");
-        client.delete_raw(ResourceKind::Pod, Some(ns), name).await?;
+        let typed: rk_types::Pod = serde_json::from_value((*pod).clone())?;
+        if typed
+            .metadata
+            .owner_references
+            .iter()
+            .any(|o| o.kind == ResourceKind::Job)
+        {
+            if !matches!(
+                typed.status.phase,
+                rk_types::PodPhase::Succeeded | rk_types::PodPhase::Failed
+            ) {
+                let mut evicted = typed;
+                evicted.status.phase = rk_types::PodPhase::Failed;
+                evicted.status.message = Some(rk_types::job::EVICTED_ATTEMPT_MESSAGE.into());
+                client.replace(&evicted).await?;
+            }
+        } else {
+            client.delete_raw(ResourceKind::Pod, Some(ns), name).await?;
+        }
         print_line(&format!("evicting pod {ns}/{name}"));
     }
     print_line(&format!(

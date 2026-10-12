@@ -168,6 +168,7 @@ fn run_cli() -> anyhow::Result<()> {
             let summary = runtime.block_on(container::run(
                 &store,
                 RunOptions {
+                    mounts: Vec::new(),
                     name,
                     image,
                     limits: Limits { cpu: cpus, memory },

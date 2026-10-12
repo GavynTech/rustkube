@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use clap::Parser;
 use rk_controllers::deployment::{self, DeployOp, RsView};
-use rk_controllers::node;
 use rk_controllers::replicaset::{self, RsOp};
 use rk_controllers::support::{self, POD_TEMPLATE_HASH_LABEL};
 use rk_controllers::{ControllersConfig, gc};
+use rk_controllers::{job, node};
+use rk_types::Job;
 use rk_types::client::ApiClient;
 use rk_types::client::reflector::{Cache, reflect, snapshot};
 use rk_types::workloads::{PodTemplateSpec, ReplicaSet, ReplicaSetSpec};
@@ -95,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
         }
         reconcile_deployments(&client, &caches).await;
         reconcile_replicasets(&client, &caches).await;
+        if let Err(err) = reconcile_jobs(&client).await {
+            warn!(error = %err, "Job reconciliation failed");
+        }
         reconcile_nodes(&client, &caches, not_ready_after, evict_after).await;
         collect_garbage(&client, &caches).await;
     }
@@ -329,6 +333,18 @@ async fn reconcile_nodes(
         };
         if dead.contains(node) && !support::is_terminal(pod) {
             let ns = pod.metadata.namespace_or_default();
+            if pod
+                .metadata
+                .owner_references
+                .iter()
+                .any(|o| o.kind == ResourceKind::Job)
+            {
+                let mut failed = pod.clone();
+                failed.status.phase = rk_types::PodPhase::Failed;
+                failed.status.message = Some(rk_types::job::EVICTED_ATTEMPT_MESSAGE.into());
+                replace_logging(client, &failed, "lost Job attempt").await;
+                continue;
+            }
             match client.delete::<Pod>(Some(ns), &pod.metadata.name).await {
                 Ok(_) => warn!(pod = %pod.metadata.name, %node, "evicted pod from dead node"),
                 Err(rk_types::client::ClientError::Api { status: 404, .. }) => {}
@@ -387,5 +403,271 @@ async fn replace_logging<R: Resource>(client: &ApiClient, object: &R, what: &str
         // Stale cache: the next pass recomputes against the fresh object.
         Err(rk_types::client::ClientError::Api { status: 409, .. }) => {}
         Err(err) => warn!(%what, error = %err, "status update failed"),
+    }
+}
+
+// Finite workloads use authoritative lists rather than independently lagging
+// caches: a successful create must be visible before the next batch is planned.
+async fn reconcile_jobs(client: &ApiClient) -> Result<(), rk_types::client::ClientError> {
+    let jobs = client.list::<Job>(None).await?.items;
+    for job in &jobs {
+        let pods = client
+            .list::<Pod>(Some(job.metadata.namespace_or_default()))
+            .await?
+            .items;
+        let plan = job::reconcile(job, &pods);
+        if job.status != plan.status {
+            let mut updated = job.clone();
+            updated.status = plan.status;
+            // Persist completion before cancellation or another attempt.
+            if client.replace(&updated).await.is_err() {
+                continue;
+            }
+        }
+        for name in plan.cancel {
+            client
+                .delete::<Pod>(Some(job.metadata.namespace_or_default()), &name)
+                .await?;
+        }
+        for (index, attempt) in plan.create {
+            let pod = job::build_pod(job, index, attempt);
+            match client.create(&pod).await {
+                Ok(_) => info!(job = %job.metadata.name, index, attempt, "created Job attempt"),
+                Err(rk_types::client::ClientError::Api { status: 409, .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    // Resolve each owner directly: a Job created during this pass must not be
+    // mistaken for an orphan because it was absent from the initial list.
+    for pod in client.list::<Pod>(None).await?.items {
+        if let Some(owner) = pod
+            .metadata
+            .owner_references
+            .iter()
+            .find(|o| o.kind == ResourceKind::Job)
+        {
+            let parent = client
+                .get::<Job>(Some(pod.metadata.namespace_or_default()), &owner.name)
+                .await?;
+            if !parent.is_some_and(|j| j.metadata.uid.is_some() && j.metadata.uid == owner.uid) {
+                match client
+                    .delete::<Pod>(
+                        Some(pod.metadata.namespace_or_default()),
+                        &pod.metadata.name,
+                    )
+                    .await
+                {
+                    Ok(_) | Err(rk_types::client::ClientError::Api { status: 404, .. }) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod job_integration_tests {
+    use super::*;
+    use rk_types::{JobPhase, PodPhase};
+    async fn server() -> ApiClient {
+        let store = rk_store::SqliteStore::in_memory().await.unwrap();
+        let state = rk_api::resources::AppState {
+            store: Arc::new(store),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, rk_api::server::router(state))
+                .await
+                .unwrap();
+        });
+        ApiClient::new(format!("http://{addr}")).unwrap()
+    }
+    async fn create_job(client: &ApiClient) -> Job {
+        let job: Job = serde_yaml::from_str("kind: Job\nmetadata:\n  name: sweep\nspec:\n  completions: 2\n  parallelism: 1\n  backoffLimit: 1\n  template:\n    spec:\n      restartPolicy: Never\n      containers:\n      - name: sim\n        image: alpine:3.21\n").unwrap();
+        client.create(&job).await.unwrap()
+    }
+    async fn pods(client: &ApiClient) -> Vec<Pod> {
+        client.list::<Pod>(None).await.unwrap().items
+    }
+    #[tokio::test]
+    async fn finite_batch_retries_completes_and_garbage_collects_over_http() {
+        let client = server().await;
+        let job = create_job(&client).await;
+        reconcile_jobs(&client).await.unwrap();
+        reconcile_jobs(&client).await.unwrap();
+        let mut first = pods(&client).await.remove(0);
+        assert_eq!(pods(&client).await.len(), 1);
+        first.status.phase = PodPhase::Failed;
+        client.replace(&first).await.unwrap();
+        reconcile_jobs(&client).await.unwrap();
+        let mut retry = pods(&client)
+            .await
+            .into_iter()
+            .find(|p| p.status.phase == PodPhase::Pending)
+            .unwrap();
+        assert_eq!(retry.metadata.labels[job::INDEX], "0");
+        assert_eq!(retry.metadata.labels[job::ATTEMPT], "1");
+        retry.status.phase = PodPhase::Succeeded;
+        client.replace(&retry).await.unwrap();
+        reconcile_jobs(&client).await.unwrap();
+        let mut second = pods(&client)
+            .await
+            .into_iter()
+            .find(|p| p.status.phase == PodPhase::Pending)
+            .unwrap();
+        assert_eq!(second.metadata.labels[job::INDEX], "1");
+        second.status.phase = PodPhase::Succeeded;
+        client.replace(&second).await.unwrap();
+        reconcile_jobs(&client).await.unwrap();
+        let done = client
+            .get::<Job>(Some("default"), "sweep")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status.phase, JobPhase::Complete);
+        assert_eq!(done.status.succeeded, 2);
+        assert_eq!(done.status.failed, 1);
+        // Reapply original spec without status, then remove attempt history.
+        let mut manifest = serde_json::to_value(job).unwrap();
+        manifest.as_object_mut().unwrap().remove("status");
+        manifest["metadata"]["resourceVersion"] = serde_json::json!(done.metadata.resource_version);
+        client
+            .replace_raw(ResourceKind::Job, Some("default"), "sweep", &manifest)
+            .await
+            .unwrap();
+        for pod in pods(&client).await {
+            client
+                .delete::<Pod>(Some("default"), &pod.metadata.name)
+                .await
+                .unwrap();
+        }
+        reconcile_jobs(&client).await.unwrap();
+        assert!(pods(&client).await.is_empty());
+        assert_eq!(
+            client
+                .get::<Job>(Some("default"), "sweep")
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .phase,
+            JobPhase::Complete
+        );
+        client
+            .delete::<Job>(Some("default"), "sweep")
+            .await
+            .unwrap();
+        create_job(&client).await;
+        reconcile_jobs(&client).await.unwrap();
+        assert_eq!(pods(&client).await.len(), 1);
+        client
+            .delete::<Job>(Some("default"), "sweep")
+            .await
+            .unwrap();
+        reconcile_jobs(&client).await.unwrap();
+        assert!(pods(&client).await.is_empty());
+    }
+    #[tokio::test]
+    async fn exhausted_retry_budget_survives_attempt_cleanup() {
+        let client = server().await;
+        create_job(&client).await;
+        for _ in 0..2 {
+            reconcile_jobs(&client).await.unwrap();
+            let mut p = pods(&client)
+                .await
+                .into_iter()
+                .find(|p| p.status.phase == PodPhase::Pending)
+                .unwrap();
+            p.status.phase = PodPhase::Failed;
+            client.replace(&p).await.unwrap();
+            reconcile_jobs(&client).await.unwrap();
+            client
+                .delete::<Pod>(Some("default"), &p.metadata.name)
+                .await
+                .unwrap();
+        }
+        reconcile_jobs(&client).await.unwrap();
+        let job = client
+            .get::<Job>(Some("default"), "sweep")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status.phase, JobPhase::Failed);
+        assert_eq!(job.status.failed, 2);
+        assert!(
+            pods(&client)
+                .await
+                .iter()
+                .all(|p| p.status.phase == PodPhase::Failed)
+        );
+    }
+    #[tokio::test]
+    async fn lost_node_retains_attempt_history_and_retries_with_new_index_attempt() {
+        let client = server().await;
+        create_job(&client).await;
+        reconcile_jobs(&client).await.unwrap();
+        let mut pod = pods(&client).await.remove(0);
+        pod.spec.node_name = Some("lost-worker".into());
+        pod.status.phase = PodPhase::Running;
+        let pod = client.replace(&pod).await.unwrap();
+        let node: Node = serde_yaml::from_str("metadata:\n  name: lost-worker\n").unwrap();
+        let node = client.create(&node).await.unwrap();
+        let caches = Caches {
+            deployments: Arc::default(),
+            replicasets: Arc::default(),
+            pods: Arc::default(),
+            nodes: Arc::default(),
+        };
+        caches.pods.lock().await.insert("pod".into(), pod.clone());
+        caches.nodes.lock().await.insert("node".into(), node);
+        reconcile_nodes(
+            &client,
+            &caches,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .await;
+        let failed = client
+            .get::<Pod>(Some("default"), &pod.metadata.name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status.phase, PodPhase::Failed);
+        assert_eq!(
+            failed.status.message.as_deref(),
+            Some(rk_types::job::EVICTED_ATTEMPT_MESSAGE)
+        );
+        reconcile_jobs(&client).await.unwrap();
+        let all = pods(&client).await;
+        assert_eq!(all.len(), 2);
+        let retry = all
+            .iter()
+            .find(|p| p.status.phase == PodPhase::Pending)
+            .unwrap();
+        assert_eq!(retry.metadata.labels[job::INDEX], "0");
+        assert_eq!(retry.metadata.labels[job::ATTEMPT], "1");
+    }
+
+    #[tokio::test]
+    async fn job_admission_rejects_invalid_batches_and_spec_changes() {
+        let client = server().await;
+        let job = create_job(&client).await;
+        let mut changed = job.clone();
+        changed.spec.completions = 3;
+        assert!(client.replace(&changed).await.is_err());
+        for (parallelism, policy) in [
+            (0, rk_types::RestartPolicy::Never),
+            (3, rk_types::RestartPolicy::Never),
+            (1, rk_types::RestartPolicy::Always),
+        ] {
+            let mut bad = job.clone();
+            bad.metadata.name = "bad".into();
+            bad.spec.parallelism = parallelism;
+            bad.spec.template.spec.restart_policy = policy;
+            assert!(client.create(&bad).await.is_err());
+        }
     }
 }
